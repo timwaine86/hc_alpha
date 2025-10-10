@@ -2,8 +2,8 @@ name: weekly-insights
 
 on:
   schedule:
-    - cron: "0 6 * * 1"    # every Monday 06:00 UTC
-  workflow_dispatch: {}     # manual run button
+    - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+  workflow_dispatch:
 
 jobs:
   run:
@@ -23,13 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests
 
-      # TEMP: provide a small CSV so the job runs (replace with Apify later)
-      - name: Provide latest CSV
+      - name: Provide sample CSV
         run: |
           mkdir -p pipeline
-          printf "date,likes,comments,views,followers,url,caption,format\n" > pipeline/latest_posts.csv
-          printf "2025-10-08,120,12,5000,485000,https://instagram.com/p/test-a,Test A,Reel\n" >> pipeline/latest_posts.csv
-          printf "2025-10-05,80,6,4000,485000,https://instagram.com/p/test-b,Test B,Reel\n" >> pipeline/latest_posts.csv
+          echo "date,likes,comments,views,followers,url,caption,format" > pipeline/latest_posts.csv
+          echo "2025-10-08,120,12,5000,485000,https://instagram.com/p/test-a,Test A,Reel" >> pipeline/latest_posts.csv
+          echo "2025-10-05,80,6,4000,485000,https://instagram.com/p/test-b,Test B,Reel" >> pipeline/latest_posts.csv
 
       - name: Run baseline → Notion
         env:
