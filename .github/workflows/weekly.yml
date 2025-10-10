@@ -1,0 +1,44 @@
+name: weekly-insights
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"    # every Monday 06:00 UTC
+  workflow_dispatch: {}     # manual run button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas python-dateutil python-dotenv requests
+
+      # TEMP: provide a small CSV so the job runs.
+      # Replace this with your Apify/S3 curl later.
+      - name: Provide latest CSV
+        run: |
+          mkdir -p pipeline
+          cat > pipeline/latest_posts.csv << 'CSV'
+date,likes,comments,views,followers,url,caption,format
+2025-10-08,120,12,5000,485000,https://instagram.com/p/test-a,Test A,Reel
+2025-10-05,80,6,4000,485000,https://instagram.com/p/test-b,Test B,Reel
+CSV
+
+      - name: Run baseline → Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+          BASELINE_ER_MEDIAN: "0.95"
+          BASELINE_IVR_MEDIAN: "3.09"
+          HC_INPUT_CSV: pipeline/latest_posts.csv
+          HC_FOLLOWERS: "485000"
+        run: |
+          python pipeline/baseline_check.py
