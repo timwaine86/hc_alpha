@@ -23,6 +23,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
+      - name: Debug Apify secrets
+        shell: bash
+        run: |
+          echo "APIFY_TOKEN length: ${#APIFY_TOKEN:-0}"
+          echo "APIFY_TASK_ID: ${APIFY_TASK_ID:-<empty>}"
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
+
       - name: Run Apify Task and download fresh CSV
         shell: bash
         env:
