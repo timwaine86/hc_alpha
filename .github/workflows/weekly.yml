@@ -1,9 +1,12 @@
+# .github/workflows/weekly.yml
 name: weekly-insights
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # run manually from Actions tab
   schedule:
-    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'     # every Monday 06:00 UTC
+    # (Optional) daily 09:00 UK (typically UTC+0/UTC+1):
+    # - cron: '0 8 * * *'
 
 jobs:
   run:
@@ -23,21 +26,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      - name: Provide sample CSV
-        shell: bash
+      # --- Pull fresh MAS+ IG posts from Apify Task (posts only) ---
+      - name: Run Apify Task and download fresh CSV
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}     # apify_api_xxx
+          APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }} # from https://console.apify.com/tasks/<ID>/...
         run: |
           mkdir -p pipeline
-          echo "date,likes,comments,views,followers,url,caption,format" > pipeline/latest_posts.csv
-          echo "2025-10-08,120,12,5000,485000,https://instagram.com/p/test-a,Test A,Reel" >> pipeline/latest_posts.csv
-          echo "2025-10-05,80,6,4000,485000,https://instagram.com/p/test-b,Test B,Reel" >> pipeline/latest_posts.csv
+          OUT="pipeline/latest_posts.csv"
+          curl -fsSL \
+            "https://api.apify.com/v2/actor-tasks/${APIFY_TASK_ID}/run-sync-get-dataset-items?token=${APIFY_TOKEN}&format=csv&clean=true" \
+            -o "$OUT"
+          echo "First lines of downloaded CSV:"
+          head -5 "$OUT"
 
+      # --- Analyse + classify + post Weekly Pulse / Predictive Test to Notion ---
       - name: Run baseline to Notion
         env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}        # secret_...
+          NOTION_DB_MASPLUS:  ${{ secrets.NOTION_DB_MASPLUS }}   # 32-char DB id
+          OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}      # sk-...
           BASELINE_ER_MEDIAN: '0.95'
-          BASELINE_IVR_MEDIAN: '3.09'
-          HC_INPUT_CSV: pipeline/latest_posts.csv
-          HC_FOLLOWERS: '485000'
+          BASELINE_IVR_MEDIAN:'3.09'
+          HC_INPUT_CSV:       pipeline/latest_posts.csv
+          HC_FOLLOWERS:       '485000'
         run: python pipeline/baseline_check.py
