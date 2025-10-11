@@ -1,0 +1,41 @@
+name: weekly-insights
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
+
+      - name: Provide sample CSV
+        run: |
+          mkdir -p pipeline
+          echo "date,likes,comments,views,followers,url,caption,format" > pipeline/latest_posts.csv
+          echo "2025-10-08,120,12,5000,485000,https://instagram.com/p/test-a,Test A,Reel" >> pipeline/latest_posts.csv
+          echo "2025-10-05,80,6,4000,485000,https://instagram.com/p/test-b,Test B,Reel" >> pipeline/latest_posts.csv
+
+      - name: Run baseline to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASELINE_ER_MEDIAN: '0.95'
+          BASELINE_IVR_MEDIAN: '3.09'
+          HC_INPUT_CSV: pipeline/latest_posts.csv
+          HC_FOLLOWERS: '485000'
+        run: python pipeline/baseline_check.py
