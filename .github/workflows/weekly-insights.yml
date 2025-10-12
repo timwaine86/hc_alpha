@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
 
 permissions:
   contents: read
@@ -11,10 +11,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout
@@ -30,29 +26,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      # ---- Fetch last 7 days of MAS+ posts from Apify (actor, no task id) ----
-            - name: Fetch latest MAS+ data from Apify
+      - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p pipeline
           OUT="pipeline/latest_posts.csv"
           BODY="pipeline/apify_body.out"
-          CODE="pipeline/apify_code.txt"
           HDRS="pipeline/apify_headers.txt"
 
-          # Minimal, valid input for apify~instagram-post-scraper
-          JSON_PAYLOAD=$(cat <<'JSON'
+          # Minimal valid input for apify~instagram-post-scraper.
+          read -r -d '' JSON_PAYLOAD <<'JSON'
           {
             "usernames": ["masbymessi"],
             "resultsLimit": 30,
             "proxy": { "useApifyProxy": true }
           }
           JSON
-          )
 
-          # Call actor and capture everything cleanly
           HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -63,10 +56,8 @@ jobs:
             -o "$OUT" \
             -w "%{http_code}")
 
-          echo "$HTTP_CODE" > "$CODE"
-
           if [ "$HTTP_CODE" != "200" ]; then
-            # Re-run without file output to capture the JSON error body for debugging
+            # Capture JSON error to help debug
             curl -sS \
               -H "Authorization: Bearer ${APIFY_TOKEN}" \
               -H "Content-Type: application/json" \
@@ -87,18 +78,16 @@ jobs:
           echo "First lines of downloaded CSV:"
           head -5 "$OUT" || true
 
-          # Optional: ensure file is not empty
           if [ ! -s "$OUT" ]; then
             echo "Downloaded CSV is empty."
             exit 1
           fi
 
-      # ---- Analyse → classify → post to Notion ----
       - name: Run baseline → Notion
         env:
-          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}        # secret_...
-          NOTION_DB_MASPLUS:  ${{ secrets.NOTION_DB_MASPLUS }}   # 32-char DB id
-          OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}      # sk-...
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS:  ${{ secrets.NOTION_DB_MASPLUS }}
+          OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}
           BASELINE_ER_MEDIAN: '0.95'
           BASELINE_IVR_MEDIAN: '3.09'
           HC_INPUT_CSV:       pipeline/latest_posts.csv
