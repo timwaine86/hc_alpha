@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      - name: Fetch latest MAS+ data from Apify
+            - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         shell: bash
@@ -37,9 +37,10 @@ jobs:
           BODY="pipeline/apify_body.out"
           HDRS="pipeline/apify_headers.txt"
 
+          # NOTE: this actor expects 'username' (singular)
           JSON_PAYLOAD=$(cat <<'JSON'
           {
-            "usernames": ["masbymessi"],
+            "username": "masbymessi",
             "resultsLimit": 30,
             "proxy": { "useApifyProxy": true }
           }
