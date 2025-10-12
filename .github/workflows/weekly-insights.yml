@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 
-# Avoid overlapping runs on the same ref (prevents duplicate Apify charges)
+# Avoid overlapping runs on the same branch (prevents duplicate Apify charges)
 concurrency:
   group: weekly-insights-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -32,11 +32,9 @@ jobs:
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
       # 1) Start Apify actor (async) -> poll until SUCCEEDED -> download CSV
-      - name: Fetch latest MAS+ data from Apify (async poll, no 300s cap)
+      - name: Fetch latest MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-          APIFY_POLL_SECONDS: '30'     # poll interval (secs)
-          APIFY_POLL_MAX_TRIES: '120'  # 120 * 30s = 60 minutes ceiling (adjust if needed)
         run: |
           set -euo pipefail
           mkdir -p pipeline
@@ -49,14 +47,14 @@ jobs:
             "proxy": { "useApifyProxy": true }
           }'
 
-          # Start the run (async)
+          # Start run (async)
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
             -d "${JSON_PAYLOAD}" > "${RUN_JSON}"
 
-          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
+          RUN_ID=$(python -c 'import json,sys; print((json.load(open(sys.argv[1])) or {}).get("data",{}).get("id",""))' "${RUN_JSON}")
           if [ -z "${RUN_ID}" ]; then
             echo "Failed to start Apify run. Response:"
             sed -n '1,200p' "${RUN_JSON}" || true
@@ -64,41 +62,24 @@ jobs:
           fi
           echo "Apify run started: ${RUN_ID} — polling…"
 
-          INTERVAL="${APIFY_POLL_SECONDS}"
-          MAX_TRIES="${APIFY_POLL_MAX_TRIES}"
+          # Poll until SUCCEEDED (no arbitrary ceiling here)
           i=0
-          STATUS=""
-          RESP=""
           while :; do
-            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
-              "https://api.apify.com/v2/actor-runs/${RUN_ID}")
+            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
             echo "  status: ${STATUS} (t=${i})"
-
-            case "${STATUS}" in
-              SUCCEEDED) break;;
-              FAILED|TIMED-OUT|ABORTED)
-                echo "Run ended with status: ${STATUS}"
-                printf "%s\n" "${RESP}" | sed -n '1,200p'
-                exit 1;;
-              *) : ;;
-            esac
-
-            # Print a short log tail every 10 polls to show progress
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "  fetching recent logs…"
-              curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
-  "https://api.apify.com/v2/actor-runs/${RUN_ID}/log?limit=30" \
-  | tail -n 30 || true
-
-            i=$((i+1))
-            if [ "${MAX_TRIES}" != "0" ] && [ $i -ge "${MAX_TRIES}" ]; then
-              echo "Reached polling ceiling (${MAX_TRIES} tries). Increase APIFY_POLL_MAX_TRIES or APIFY_POLL_SECONDS if needed."
+            if [ "${STATUS}" = "SUCCEEDED" ]; then
+              break
+            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED-OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
+              echo "Run ended with status: ${STATUS}"
+              printf "%s\n" "${RESP}" | sed -n '1,200p'
               exit 1
             fi
-            sleep "${INTERVAL}"
+            i=$((i+1))
+            sleep 30
           done
 
+          # Download dataset CSV
           DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
           if [ -z "${DATASET_ID}" ]; then
             echo "No dataset id found. Full run object:"
@@ -106,10 +87,7 @@ jobs:
             exit 1
           fi
 
-          curl -sS \
-            "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -o "${OUT_RAW}"
-
+          curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
           if [ ! -s "${OUT_RAW}" ]; then
             echo "Downloaded CSV is empty."
             exit 1
