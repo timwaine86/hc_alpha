@@ -24,7 +24,7 @@ jobs:
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
       # ---- Fetch last 7 days of MAS+ posts from Apify (actor, no task id) ----
-      - name: Fetch latest MAS+ data from Apify
+            - name: Fetch latest MAS+ data from Apify
         shell: bash
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -32,24 +32,38 @@ jobs:
           set -e
           mkdir -p pipeline
           OUT="pipeline/latest_posts.csv"
+          ERR="pipeline/apify_error.txt"
 
           # Rolling 7-day window (Ubuntu runner has GNU date)
           FROM_DATE=$(date -u -d '7 days ago' '+%Y-%m-%dT00:00:00.000Z')
 
-          # Build JSON payload without heredocs
-          DIRECT_URL="https://www.instagram.com/masbymessi/"
-          JSON_PAYLOAD=$(printf '{"directUrls":["%s"],"resultsLimit":30,"scrapePosts":true,"fromDate":"%s"}' "$DIRECT_URL" "$FROM_DATE")
+          # Use 'usernames' (more widely supported) instead of directUrls
+          JSON_PAYLOAD=$(printf '{"usernames":["masbymessi"],"resultsLimit":30,"scrapePosts":true,"fromDate":"%s"}' "$FROM_DATE")
 
-          # Call official actor; put token in header and query
-          curl -fsSL -X POST \
+          # Call official actor; put token in header and query, and capture errors
+          set +e
+          curl -sS -w "\n%{http_code}\n" -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
             -d "$JSON_PAYLOAD" \
-            -o "$OUT"
+            -o "$OUT" > "$ERR"
+          CODE=$(tail -n1 "$ERR")
+          head -n -1 "$ERR" > "$ERR.body" || true
+          set -e
+
+          if [ "$CODE" != "200" ]; then
+            echo "Apify returned HTTP $CODE"
+            echo "Request payload:"
+            echo "$JSON_PAYLOAD"
+            echo "---- Response body ----"
+            cat "$ERR.body" || true
+            exit 1
+          fi
 
           echo "First lines of downloaded CSV:"
           head -5 "$OUT"
+
 
       # ---- Analyse → classify → post to Notion ----
       - name: Run baseline → Notion
