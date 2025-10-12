@@ -1,0 +1,64 @@
+name: weekly-insights
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
+
+      # ---- Fetch last 7 days of MAS+ posts from Apify (actor, no task id) ----
+      - name: Fetch latest MAS+ data from Apify
+        shell: bash
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: |
+          set -e
+          mkdir -p pipeline
+          OUT="pipeline/latest_posts.csv"
+
+          # Rolling 7-day window (Ubuntu runner has GNU date)
+          FROM_DATE=$(date -u -d '7 days ago' '+%Y-%m-%dT00:00:00.000Z')
+
+          # Build JSON payload without heredocs
+          DIRECT_URL="https://www.instagram.com/masbymessi/"
+          JSON_PAYLOAD=$(printf '{"directUrls":["%s"],"resultsLimit":30,"scrapePosts":true,"fromDate":"%s"}' "$DIRECT_URL" "$FROM_DATE")
+
+          # Call official actor; put token in header and query
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${APIFY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
+            -d "$JSON_PAYLOAD" \
+            -o "$OUT"
+
+          echo "First lines of downloaded CSV:"
+          head -5 "$OUT"
+
+      # ---- Analyse → classify → post to Notion ----
+      - name: Run baseline → Notion
+        env:
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}        # secret_...
+          NOTION_DB_MASPLUS:  ${{ secrets.NOTION_DB_MASPLUS }}   # 32-char DB id
+          OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}      # sk-...
+          BASELINE_ER_MEDIAN: '0.95'
+          BASELINE_IVR_MEDIAN:'3.09'
+          HC_INPUT_CSV:       pipeline/latest_posts.csv
+          HC_FOLLOWERS:       '485000'
+        run: python pipeline/baseline_check.py
