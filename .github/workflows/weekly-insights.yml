@@ -26,14 +26,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      # Start Apify run -> poll until SUCCEEDED -> download CSV
+      # 1) Start Apify actor -> poll until SUCCEEDED -> download CSV
       - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p pipeline
-          OUT="pipeline/latest_posts_raw.csv"
+          OUT_RAW="pipeline/latest_posts_raw.csv"
           RUN_JSON="pipeline/apify_run.json"
 
           JSON_PAYLOAD='{
@@ -42,85 +42,107 @@ jobs:
             "proxy": { "useApifyProxy": true }
           }'
 
+          # Start the run (201 Created expected)
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
             -d "${JSON_PAYLOAD}" > "${RUN_JSON}"
 
+          # Extract run id
           RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          [ -n "${RUN_ID}" ] || { echo "Failed to start run"; sed -n '1,200p' "${RUN_JSON}"; exit 1; }
-
+          if [ -z "${RUN_ID}" ]; then
+            echo "Failed to start Apify run. Response:"
+            sed -n '1,200p' "${RUN_JSON}" || true
+            exit 1
+          fi
           echo "Apify run started: ${RUN_ID} — polling…"
-          MAX_TRIES=72
+
+          # Poll run status until SUCCEEDED (max ~6 minutes)
+          MAX_TRIES=72  # 72 * 5s
           i=0
           STATUS=""
           RESP=""
           while [ ${i} -lt ${MAX_TRIES} ]; do
-            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
+            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
+              "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))')
             echo "  status: ${STATUS}"
             case "${STATUS}" in
               SUCCEEDED) break;;
-              FAILED|TIMED-OUT|ABORTED) echo "Run ended: ${STATUS}"; printf "%s\n" "${RESP}" | sed -n '1,200p'; exit 1;;
+              FAILED|TIMED-OUT|ABORTED)
+                echo "Run ended with status: ${STATUS}"
+                printf "%s\n" "${RESP}" | sed -n '1,200p'
+                exit 1;;
             esac
-            sleep 5; i=$((i+1))
+            sleep 5
+            i=$((i+1))
           done
-          [ "${STATUS}" = "SUCCEEDED" ] || { echo "Timeout waiting for Apify"; exit 1; }
+          if [ "${STATUS}" != "SUCCEEDED" ]; then
+            echo "Timeout waiting for Apify run to finish."
+            exit 1
+          fi
 
+          # Get dataset id and download CSV
           DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          [ -n "${DATASET_ID}" ] || { echo "No dataset id"; printf "%s\n" "${RESP}" | sed -n '1,200p'; exit 1; }
+          if [ -z "${DATASET_ID}" ]; then
+            echo "No dataset id found. Full run object:"
+            printf "%s\n" "${RESP}" | sed -n '1,200p'
+            exit 1
+          fi
 
-          curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT}"
-          [ -s "${OUT}" ] || { echo "Downloaded CSV is empty."; exit 1; }
+          curl -sS \
+            "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" \
+            -o "${OUT_RAW}"
+
+          if [ ! -s "${OUT_RAW}" ]; then
+            echo "Downloaded CSV is empty."
+            exit 1
+          fi
 
           echo "Raw CSV preview:"
-          head -5 "${OUT}"
+          head -5 "${OUT_RAW}"
 
-      # Normalize CSV: create date_v4 and keep common fields
+      # 2) Normalize CSV: create date_v4 etc. for baseline_check.py
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
-          import pandas as pd, sys
+          import pandas as pd
           src = "pipeline/latest_posts_raw.csv"
           dst = "pipeline/latest_posts.csv"
           df = pd.read_csv(src)
 
-          # Lowercase map for easy lookup
-          lower_map = {c.lower(): c for c in df.columns}
-
-          # Candidate date fields from Apify/IG actors
-          date_candidates = ["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso"]
-          date_col = next((lower_map[c] for c in date_candidates if c in lower_map), None)
-          if date_col is None:
+          lower = {c.lower(): c for c in df.columns}
+          # pick a date-like column from common possibilities
+          candidates = ["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
+          col = next((lower[c] for c in candidates if c in lower), None)
+          if col is None:
             raise SystemExit(f"No date-like column found. Columns: {list(df.columns)}")
 
-          s = df[date_col]
-          # Parse robustly
+          s = df[col]
           d = pd.to_datetime(s, errors="coerce", utc=True)
           if d.isna().all():
-            # try unix seconds then ms
             d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="s", utc=True)
             if d.isna().all():
               d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="ms", utc=True)
-
           if d.isna().all():
-            raise SystemExit(f"Could not parse dates from column {date_col}")
+            raise SystemExit(f"Could not parse dates from column {col}")
 
           df["date_v4"] = d.dt.strftime("%Y-%m-%d")
 
-          # Optional: ensure some useful columns exist
-          rename_map = {}
-          if "shortcode" in lower_map: rename_map[lower_map["shortcode"]] = "shortCode"
-          if "short_code" in lower_map: rename_map[lower_map["short_code"]] = "shortCode"
-          df = df.rename(columns=rename_map)
+          # Friendly renames commonly used downstream
+          ren = {}
+          if "shortcode" in lower: ren[lower["shortcode"]] = "shortCode"
+          if "short_code" in lower: ren[lower["short_code"]] = "shortCode"
+          if "url" in lower: ren[lower["url"]] = "postUrl"
+          df = df.rename(columns=ren)
 
           df.to_csv(dst, index=False)
           print("Normalized columns:", list(df.columns))
-          print("Sample:")
           print(df.head(5).to_string())
           PY
 
+      # 3) Run your analysis and push to Notion
       - name: Run baseline → Notion
         env:
           NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
@@ -128,6 +150,8 @@ jobs:
           OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}
           BASELINE_ER_MEDIAN: '0.95'
           BASELINE_IVR_MEDIAN: '3.09'
-          HC_INPUT_CSV:       pipeline/latest_posts.csv   # use normalized file
+          HC_INPUT_CSV:       pipeline/latest_posts.csv   # normalized file
           HC_FOLLOWERS:       '485000'
+          # Optional: if your script supports it, allow auto-create when query returns no pages
+          NOTION_CREATE_IF_MISSING: '1'
         run: python pipeline/baseline_check.py
