@@ -5,9 +5,16 @@ on:
   schedule:
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
 
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -24,8 +31,7 @@ jobs:
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
       # ---- Fetch last 7 days of MAS+ posts from Apify (actor, no task id) ----
-            - name: Fetch latest MAS+ data from Apify
-        shell: bash
+      - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
@@ -63,7 +69,6 @@ jobs:
 
           echo "First lines of downloaded CSV:"
           head -5 "$OUT"
-
 
       # ---- Analyse → classify → post to Notion ----
       - name: Run baseline → Notion
