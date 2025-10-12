@@ -32,7 +32,7 @@ jobs:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           APIFY_TASK_ID: ${{ secrets.APIFY_TASK_ID }}
 
-            - name: Run Apify Actor (posts only) and download fresh CSV
+      - name: Run Apify Actor (posts only) and download fresh CSV
         shell: bash
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
