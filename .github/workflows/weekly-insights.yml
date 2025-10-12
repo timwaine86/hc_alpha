@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Prevent overlapping runs on the same branch (avoids duplicate Apify charges)
+concurrency:
+  group: weekly-insights-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   weekly_job:
     runs-on: ubuntu-latest
@@ -26,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      # 1) Start Apify actor -> poll until SUCCEEDED -> download CSV
+      # 1) Start actor synchronously and download items directly as CSV (no polling, no timeouts here)
       - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -34,7 +39,7 @@ jobs:
           set -euo pipefail
           mkdir -p pipeline
           OUT_RAW="pipeline/latest_posts_raw.csv"
-          RUN_JSON="pipeline/apify_run.json"
+          BODY="pipeline/apify_error.json"
 
           JSON_PAYLOAD='{
             "username": ["masbymessi"],
@@ -42,68 +47,35 @@ jobs:
             "proxy": { "useApifyProxy": true }
           }'
 
-          # Start the run (201 Created expected)
-          curl -sS -X POST \
+          # This waits for the run to finish and returns the dataset items
+          HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
-            -d "${JSON_PAYLOAD}" > "${RUN_JSON}"
+            -X POST \
+            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
+            -d "${JSON_PAYLOAD}" \
+            -o "${OUT_RAW}" \
+            -w "%{http_code}" || true)
 
-          # Extract run id
-          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          if [ -z "${RUN_ID}" ]; then
-            echo "Failed to start Apify run. Response:"
-            sed -n '1,200p' "${RUN_JSON}" || true
-            exit 1
-          fi
-          echo "Apify run started: ${RUN_ID} — polling…"
+          if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "${OUT_RAW}" ]; then
+            # Print the JSON error so we see exactly what schema/limit message came back
+            curl -sS \
+              -H "Authorization: Bearer ${APIFY_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
+              -d "${JSON_PAYLOAD}" > "${BODY}" || true
 
-          # Poll run status until SUCCEEDED (max ~6 minutes)
-          MAX_TRIES=72  # 72 * 5s
-          i=0
-          STATUS=""
-          RESP=""
-          while [ ${i} -lt ${MAX_TRIES} ]; do
-            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
-              "https://api.apify.com/v2/actor-runs/${RUN_ID}")
-            STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))')
-            echo "  status: ${STATUS}"
-            case "${STATUS}" in
-              SUCCEEDED) break;;
-              FAILED|TIMED-OUT|ABORTED)
-                echo "Run ended with status: ${STATUS}"
-                printf "%s\n" "${RESP}" | sed -n '1,200p'
-                exit 1;;
-            esac
-            sleep 5
-            i=$((i+1))
-          done
-          if [ "${STATUS}" != "SUCCEEDED" ]; then
-            echo "Timeout waiting for Apify run to finish."
-            exit 1
-          fi
-
-          # Get dataset id and download CSV
-          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          if [ -z "${DATASET_ID}" ]; then
-            echo "No dataset id found. Full run object:"
-            printf "%s\n" "${RESP}" | sed -n '1,200p'
-            exit 1
-          fi
-
-          curl -sS \
-            "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -o "${OUT_RAW}"
-
-          if [ ! -s "${OUT_RAW}" ]; then
-            echo "Downloaded CSV is empty."
+            echo "Apify returned HTTP ${HTTP_CODE:-<none>} or empty CSV."
+            echo "---- Error body ----"
+            sed -n '1,200p' "${BODY}" || true
             exit 1
           fi
 
           echo "Raw CSV preview:"
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize CSV: create date_v4 etc. for baseline_check.py
+      # 2) Normalize CSV so baseline_check.py has date_v4 etc.
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -113,7 +85,6 @@ jobs:
           df = pd.read_csv(src)
 
           lower = {c.lower(): c for c in df.columns}
-          # pick a date-like column from common possibilities
           candidates = ["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
           col = next((lower[c] for c in candidates if c in lower), None)
           if col is None:
@@ -130,7 +101,7 @@ jobs:
 
           df["date_v4"] = d.dt.strftime("%Y-%m-%d")
 
-          # Friendly renames commonly used downstream
+          # Common friendly renames
           ren = {}
           if "shortcode" in lower: ren[lower["shortcode"]] = "shortCode"
           if "short_code" in lower: ren[lower["short_code"]] = "shortCode"
@@ -142,7 +113,7 @@ jobs:
           print(df.head(5).to_string())
           PY
 
-      # 3) Run your analysis and push to Notion
+      # 3) Run analysis → Notion
       - name: Run baseline → Notion
         env:
           NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
@@ -150,8 +121,7 @@ jobs:
           OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}
           BASELINE_ER_MEDIAN: '0.95'
           BASELINE_IVR_MEDIAN: '3.09'
-          HC_INPUT_CSV:       pipeline/latest_posts.csv   # normalized file
+          HC_INPUT_CSV:       pipeline/latest_posts.csv
           HC_FOLLOWERS:       '485000'
-          # Optional: if your script supports it, allow auto-create when query returns no pages
-          NOTION_CREATE_IF_MISSING: '1'
+          NOTION_CREATE_IF_MISSING: '1'   # optional flag if your script supports auto-create
         run: python pipeline/baseline_check.py
