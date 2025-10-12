@@ -38,91 +38,56 @@ jobs:
           mkdir -p pipeline
           OUT_RAW="pipeline/latest_posts_raw.csv"
           RUN_JSON="pipeline/apify_run.json"
-
           JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":30,"proxy":{"useApifyProxy":true}}'
-
-          # Start run (async)
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${APIFY_TOKEN}" \
-            -H "Content-Type: application/json" \
+          curl -sS -X POST -H "Authorization: Bearer ${APIFY_TOKEN}" -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
-            -d "${JSON_PAYLOAD}" \
-            -o "${RUN_JSON}"
-
+            -d "${JSON_PAYLOAD}" -o "${RUN_JSON}"
           RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          if [ -z "${RUN_ID}" ]; then
-            echo "Failed to start Apify run."
-            sed -n '1,200p' "${RUN_JSON}" || true
-            exit 1
-          fi
-          echo "Apify run started: ${RUN_ID}"
-
-          # Poll until SUCCEEDED
+          [ -n "${RUN_ID}" ] || { echo "Failed to start Apify run"; sed -n '1,200p' "${RUN_JSON}"; exit 1; }
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
-            echo "  status: ${STATUS}"
-            if [ "${STATUS}" = "SUCCEEDED" ]; then
-              break
-            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED-OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
-              echo "Run ended with status: ${STATUS}"
-              printf "%s\n" "${RESP}" | sed -n '1,200p'
-              exit 1
-            fi
+            echo "status: ${STATUS}"
+            [ "${STATUS}" = "SUCCEEDED" ] && break
+            case "${STATUS}" in FAILED|TIMED-OUT|ABORTED) echo "${RESP}"; exit 1;; esac
             sleep 30
           done
-
           DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          if [ -z "${DATASET_ID}" ]; then
-            echo "No dataset id found."
-            printf "%s\n" "${RESP}" | sed -n '1,200p'
-            exit 1
-          fi
-
+          [ -n "${DATASET_ID}" ] || { echo "No dataset id"; echo "${RESP}"; exit 1; }
           curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
-          if [ ! -s "${OUT_RAW}" ]; then
-            echo "Downloaded CSV is empty."
-            exit 1
-          fi
-
-          echo "Raw CSV preview:"
-          head -5 "${OUT_RAW}"
+          [ -s "${OUT_RAW}" ] || { echo "Empty CSV"; exit 1; }
+          echo "Raw CSV preview:"; head -5 "${OUT_RAW}"
 
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
           import pandas as pd
-          src = "pipeline/latest_posts_raw.csv"
-          dst = "pipeline/latest_posts.csv"
-          df = pd.read_csv(src)
-
-          lower = {c.lower(): c for c in df.columns}
-          candidates = ["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
-          col = next((lower[c] for c in candidates if c in lower), None)
-          if col is None:
-            raise SystemExit(f"No date-like column found. Columns: {list(df.columns)}")
-
-          s = df[col]
-          d = pd.to_datetime(s, errors="coerce", utc=True)
+          src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
+          df=pd.read_csv(src)
+          lower={c.lower():c for c in df.columns}
+          candidates=["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
+          col=next((lower[c] for c in candidates if c in lower),None)
+          if not col: raise SystemExit(f"No date-like column. Columns: {list(df.columns)}")
+          s=df[col]; d=pd.to_datetime(s,errors="coerce",utc=True)
           if d.isna().all():
-            d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="s", utc=True)
+            d=pd.to_datetime(pd.to_numeric(s,errors="coerce"),unit="s",utc=True)
             if d.isna().all():
-              d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="ms", utc=True)
-          if d.isna().all():
-            raise SystemExit(f"Could not parse dates from column {col}")
-
-          df["date_v4"] = d.dt.strftime("%Y-%m-%d")
-
-          ren = {}
-          if "shortcode" in lower: ren[lower["shortcode"]] = "shortCode"
-          if "short_code" in lower: ren[lower["short_code"]] = "shortCode"
-          if "url" in lower: ren[lower["url"]] = "postUrl"
-          df = df.rename(columns=ren)
-
-          df.to_csv(dst, index=False)
-          print("Normalized columns:", list(df.columns))
-          print(df.head(5).to_string())
+              d=pd.to_datetime(pd.to_numeric(s,errors="coerce"),unit="ms",utc=True)
+          if d.isna().all(): raise SystemExit(f"Could not parse dates from {col}")
+          df["date_v4"]=d.dt.strftime("%Y-%m-%d")
+          ren={}
+          if "shortcode" in lower: ren[lower["shortcode"]]="shortCode"
+          if "short_code" in lower: ren[lower["short_code"]]="shortCode"
+          if "url" in lower: ren[lower["url"]]="postUrl"
+          df=df.rename(columns=ren)
+          df.to_csv(dst,index=False)
+          print("Normalized columns:",list(df.columns)); print(df.head(5).to_string())
           PY
+
+      - name: Show baseline_check.py header (debug)
+        run: |
+          echo "== printing first 60 lines of pipeline/baseline_check.py =="
+          sed -n '1,60p' pipeline/baseline_check.py
 
       - name: Run baseline to Notion
         env:
@@ -133,5 +98,4 @@ jobs:
           BASELINE_IVR_MEDIAN: '3.09'
           HC_INPUT_CSV: pipeline/latest_posts.csv
           HC_FOLLOWERS: '485000'
-          NOTION_CREATE_IF_MISSING: '1'
         run: python pipeline/baseline_check.py
