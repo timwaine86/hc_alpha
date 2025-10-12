@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      - name: Fetch latest MAS+ data from Apify
+           - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         shell: bash
@@ -37,15 +37,17 @@ jobs:
           BODY="pipeline/apify_body.out"
           HDRS="pipeline/apify_headers.txt"
 
-          # Minimal valid input for apify~instagram-post-scraper.
-          read -r -d '' JSON_PAYLOAD <<'JSON'
+          # Build JSON safely (no 'read -d' which trips set -e on GitHub runners)
+          JSON_PAYLOAD=$(cat <<'JSON'
           {
             "usernames": ["masbymessi"],
             "resultsLimit": 30,
             "proxy": { "useApifyProxy": true }
           }
           JSON
+          )
 
+          # Primary request -> CSV; do NOT let curl abort the script before we can print diagnostics
           HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -54,10 +56,10 @@ jobs:
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
             -d "$JSON_PAYLOAD" \
             -o "$OUT" \
-            -w "%{http_code}")
+            -w "%{http_code}" || true)
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            # Capture JSON error to help debug
+          if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "$OUT" ]; then
+            # Re-run to capture JSON error body for visibility
             curl -sS \
               -H "Authorization: Bearer ${APIFY_TOKEN}" \
               -H "Content-Type: application/json" \
@@ -65,7 +67,7 @@ jobs:
               "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
               -d "$JSON_PAYLOAD" > "$BODY" || true
 
-            echo "Apify returned HTTP $HTTP_CODE"
+            echo "Apify returned HTTP ${HTTP_CODE:-<none>}"
             echo "Request payload:"
             echo "$JSON_PAYLOAD"
             echo "---- Response headers ----"
@@ -77,11 +79,6 @@ jobs:
 
           echo "First lines of downloaded CSV:"
           head -5 "$OUT" || true
-
-          if [ ! -s "$OUT" ]; then
-            echo "Downloaded CSV is empty."
-            exit 1
-          fi
 
       - name: Run baseline → Notion
         env:
