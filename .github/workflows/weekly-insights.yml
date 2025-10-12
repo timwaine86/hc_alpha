@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 
-# Prevent overlapping runs on the same branch (avoids duplicate Apify charges)
+# Avoid overlapping runs on the same ref (prevents duplicate Apify charges)
 concurrency:
   group: weekly-insights-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -31,15 +31,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      # 1) Start actor synchronously and download items directly as CSV (no polling, no timeouts here)
-      - name: Fetch latest MAS+ data from Apify
+      # 1) Start Apify actor (async) -> poll until SUCCEEDED -> download CSV
+      - name: Fetch latest MAS+ data from Apify (async poll, no 300s cap)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          APIFY_POLL_SECONDS: '30'     # poll interval (secs)
+          APIFY_POLL_MAX_TRIES: '120'  # 120 * 30s = 60 minutes ceiling (adjust if needed)
         run: |
           set -euo pipefail
           mkdir -p pipeline
           OUT_RAW="pipeline/latest_posts_raw.csv"
-          BODY="pipeline/apify_error.json"
+          RUN_JSON="pipeline/apify_run.json"
 
           JSON_PAYLOAD='{
             "username": ["masbymessi"],
@@ -47,28 +49,69 @@ jobs:
             "proxy": { "useApifyProxy": true }
           }'
 
-          # This waits for the run to finish and returns the dataset items
-          HTTP_CODE=$(curl -sS \
+          # Start the run (async)
+          curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
-            -X POST \
-            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -d "${JSON_PAYLOAD}" \
-            -o "${OUT_RAW}" \
-            -w "%{http_code}" || true)
+            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
+            -d "${JSON_PAYLOAD}" > "${RUN_JSON}"
 
-          if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "${OUT_RAW}" ]; then
-            # Print the JSON error so we see exactly what schema/limit message came back
-            curl -sS \
-              -H "Authorization: Bearer ${APIFY_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
-              -d "${JSON_PAYLOAD}" > "${BODY}" || true
+          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
+          if [ -z "${RUN_ID}" ]; then
+            echo "Failed to start Apify run. Response:"
+            sed -n '1,200p' "${RUN_JSON}" || true
+            exit 1
+          fi
+          echo "Apify run started: ${RUN_ID} — polling…"
 
-            echo "Apify returned HTTP ${HTTP_CODE:-<none>} or empty CSV."
-            echo "---- Error body ----"
-            sed -n '1,200p' "${BODY}" || true
+          INTERVAL="${APIFY_POLL_SECONDS}"
+          MAX_TRIES="${APIFY_POLL_MAX_TRIES}"
+          i=0
+          STATUS=""
+          RESP=""
+          while :; do
+            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
+              "https://api.apify.com/v2/actor-runs/${RUN_ID}")
+            STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
+            echo "  status: ${STATUS} (t=${i})"
+
+            case "${STATUS}" in
+              SUCCEEDED) break;;
+              FAILED|TIMED-OUT|ABORTED)
+                echo "Run ended with status: ${STATUS}"
+                printf "%s\n" "${RESP}" | sed -n '1,200p'
+                exit 1;;
+              *) : ;;
+            esac
+
+            # Print a short log tail every 10 polls to show progress
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "  fetching recent logs…"
+              curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
+                "https://api.apify.com/v2/actor-runs/${RUN_ID}/logs?limit=30" | tail -n 30 || true
+            fi
+
+            i=$((i+1))
+            if [ "${MAX_TRIES}" != "0" ] && [ $i -ge "${MAX_TRIES}" ]; then
+              echo "Reached polling ceiling (${MAX_TRIES} tries). Increase APIFY_POLL_MAX_TRIES or APIFY_POLL_SECONDS if needed."
+              exit 1
+            fi
+            sleep "${INTERVAL}"
+          done
+
+          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
+          if [ -z "${DATASET_ID}" ]; then
+            echo "No dataset id found. Full run object:"
+            printf "%s\n" "${RESP}" | sed -n '1,200p'
+            exit 1
+          fi
+
+          curl -sS \
+            "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" \
+            -o "${OUT_RAW}"
+
+          if [ ! -s "${OUT_RAW}" ]; then
+            echo "Downloaded CSV is empty."
             exit 1
           fi
 
@@ -123,5 +166,5 @@ jobs:
           BASELINE_IVR_MEDIAN: '3.09'
           HC_INPUT_CSV:       pipeline/latest_posts.csv
           HC_FOLLOWERS:       '485000'
-          NOTION_CREATE_IF_MISSING: '1'   # optional flag if your script supports auto-create
+          NOTION_CREATE_IF_MISSING: '1'
         run: python pipeline/baseline_check.py
