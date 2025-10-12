@@ -88,8 +88,8 @@ jobs:
             if [ $((i % 10)) -eq 0 ]; then
               echo "  fetching recent logs…"
               curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
-                "https://api.apify.com/v2/actor-runs/${RUN_ID}/logs?limit=30" | tail -n 30 || true
-            fi
+  "https://api.apify.com/v2/actor-runs/${RUN_ID}/log?limit=30" \
+  | tail -n 30 || true
 
             i=$((i+1))
             if [ "${MAX_TRIES}" != "0" ] && [ $i -ge "${MAX_TRIES}" ]; then
