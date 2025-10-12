@@ -26,56 +26,63 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-      - name: Fetch MAS+ data from Apify
+            - name: Fetch MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p pipeline
           OUT="pipeline/latest_posts.csv"
-          BODY="pipeline/apify_body.json"
-          HDRS="pipeline/apify_headers.txt"
 
-          # Actor expects 'username' (singular). Some versions use maxItems.
-          JSON_PAYLOAD=$(cat <<'JSON'
-          {
-            "username": "masbymessi",
-            "maxItems": 30,
-            "proxy": { "useApifyProxy": true }
-          }
-          JSON
-          )
+          call_actor () {
+            local payload="$1"
+            local fmt="$2"   # csv or json
+            local out="$3"
 
-          HTTP_CODE=$(curl -sS \
-            -H "Authorization: Bearer ${APIFY_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -D "$HDRS" \
-            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -d "$JSON_PAYLOAD" \
-            -o "$OUT" \
-            -w "%{http_code}" || true)
-
-          if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "$OUT" ]; then
             curl -sS \
               -H "Authorization: Bearer ${APIFY_TOKEN}" \
               -H "Content-Type: application/json" \
               -X POST \
-              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
-              -d "$JSON_PAYLOAD" > "$BODY" || true
+              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=${fmt}&clean=true&token=${APIFY_TOKEN}" \
+              -d "${payload}" \
+              -o "${out}" \
+              -w "%{http_code}"
+          }
 
-            echo "Apify returned HTTP ${HTTP_CODE:-<none>}"
-            echo "Request payload:"
-            echo "$JSON_PAYLOAD"
-            echo "---- Response headers ----"
-            sed -n '1,200p' "$HDRS" || true
-            echo "---- Response body ----"
-            sed -n '1,400p' "$BODY" || true
-            exit 1
+          # 1) Schema variant A: username as ARRAY
+          PAYLOAD_A='{
+            "username": ["masbymessi"],
+            "maxItems": 30,
+            "proxy": { "useApifyProxy": true }
+          }'
+
+          # 2) Schema variant B: usernames (plural)
+          PAYLOAD_B='{
+            "usernames": ["masbymessi"],
+            "maxItems": 30,
+            "proxy": { "useApifyProxy": true }
+          }'
+
+          # Try A
+          CODE=$(call_actor "${PAYLOAD_A}" "csv" "${OUT}" || true)
+          if [ "${CODE:-}" != "200" ] || [ ! -s "${OUT}" ]; then
+            echo "Attempt A failed (HTTP ${CODE:-none}). Retrying with alternate schema…"
+            # Print error body for A
+            call_actor "${PAYLOAD_A}" "json" "pipeline/apify_error_A.json" >/dev/null || true
+            sed -n '1,200p' pipeline/apify_error_A.json || true
+
+            # Try B
+            CODE=$(call_actor "${PAYLOAD_B}" "csv" "${OUT}" || true)
+            if [ "${CODE:-}" != "200" ] || [ ! -s "${OUT}" ]; then
+              echo "Attempt B failed (HTTP ${CODE:-none}). Full error body:"
+              call_actor "${PAYLOAD_B}" "json" "pipeline/apify_error_B.json" >/dev/null || true
+              sed -n '1,200p' pipeline/apify_error_B.json || true
+              exit 1
+            fi
           fi
 
           echo "CSV preview:"
-          head -5 "$OUT" || true
+          head -5 "${OUT}" || true
 
       - name: Run baseline to Notion
         env:
