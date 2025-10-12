@@ -3,13 +3,12 @@
 import os
 import json
 import time
+import traceback
 import requests
 import pandas as pd
 from datetime import timedelta
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-print(f"[baseline] running: {__file__}")
 
 load_dotenv()
 
@@ -80,17 +79,13 @@ Answer with ONLY one of:
 - Performance Mastery
 - Creative Momentum
 """
-    try:
-        from openai import OpenAI
-        client = openai_client
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
-        text = resp.choices[0].message.content.strip()
-    except Exception:
-        return "Future Clarity"
+    from openai import OpenAI
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    text = resp.choices[0].message.content.strip()
     for lab in TERRITORY_LABELS:
         if lab.lower() in text.lower():
             return lab
@@ -276,12 +271,15 @@ show(latest.sort_values("ER_uplift_pts",ascending=False).head(3),"Top by ER upli
 show(latest.sort_values("ER_uplift_pts",ascending=True).head(3),"Bottom by ER uplift:")
 
 # ---------- Notion helpers ----------
-def rt(text):
+def rt(text):  # rich_text
     return {"rich_text": [{"type": "text", "text": {"content": str(text)[:1900]}}]}
-def ttl(text):
+
+def ttl(text):  # title
     return {"title": [{"type": "text", "text": {"content": str(text)[:200]}}]}
+
 def sel(name):
     return {"select": {"name": name}}
+
 def notion_create(properties):
     if not NOTION_TOKEN or not DB_ID:
         print("⚠️ Missing NOTION_TOKEN or NOTION_DB_MASPLUS — skipping Notion write.")
@@ -299,7 +297,20 @@ def notion_create(properties):
     else:
         print("✅ Notion page created.")
 
-# ---------- Weekly Pulse (always-create) ----------
+def notion_update(page_id, properties):
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    r = requests.patch(url, headers=headers, data=json.dumps({"properties": properties}))
+    if r.status_code >= 300:
+        print("❌ Notion update error:", r.status_code, r.text)
+    else:
+        print("✅ Notion page updated.")
+
+# ---------- Weekly Pulse page (always-create: no Notion query at all) ----------
 headline_line = f"ER {fmt_pts(er_delta)} pts vs baseline | IVR {fmt_pts(ivr_delta)} pts"
 detail_line   = f"ER {fmt(er_med)}% (base {BASELINE_ER:.2f}%) • IVR {fmt(ivr_med)}% (base {BASELINE_IVR:.2f}%)"
 
@@ -328,9 +339,11 @@ pulse_props = {
     "Action": rt(f"{detail_line}\n{summary}"),
     "Title": ttl("Weekly Pulse"),
 }
+
+# Always create (no query → no IndexError)
 notion_create(pulse_props)
 
-# ---------- Predictive Test (always-create when IVR softened) ----------
+# ---------- Predictive Test (always-create if IVR softened) ----------
 if pd.notna(ivr_delta) and ivr_delta < 0:
     pred_props = {
         "Date": {"date": {"start": pd.Timestamp.utcnow().strftime("%Y-%m-%d")}},
@@ -343,3 +356,4 @@ if pd.notna(ivr_delta) and ivr_delta < 0:
         "Title": ttl("Predictive Test"),
     }
     notion_create(pred_props)
+
