@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  run:
+  weekly:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-           - name: Fetch latest MAS+ data from Apify
+      - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         shell: bash
@@ -37,7 +37,6 @@ jobs:
           BODY="pipeline/apify_body.out"
           HDRS="pipeline/apify_headers.txt"
 
-          # Build JSON safely (no 'read -d' which trips set -e on GitHub runners)
           JSON_PAYLOAD=$(cat <<'JSON'
           {
             "usernames": ["masbymessi"],
@@ -47,7 +46,6 @@ jobs:
           JSON
           )
 
-          # Primary request -> CSV; do NOT let curl abort the script before we can print diagnostics
           HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -59,7 +57,6 @@ jobs:
             -w "%{http_code}" || true)
 
           if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "$OUT" ]; then
-            # Re-run to capture JSON error body for visibility
             curl -sS \
               -H "Authorization: Bearer ${APIFY_TOKEN}" \
               -H "Content-Type: application/json" \
