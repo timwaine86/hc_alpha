@@ -58,7 +58,7 @@ jobs:
           NOTION_DB_MASPLUS:  ${{ secrets.NOTION_DB_MASPLUS }}   # 32-char DB id
           OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}      # sk-...
           BASELINE_ER_MEDIAN: '0.95'
-          BASELINE_IVR_MEDIAN:'3.09'
+          BASELINE_IVR_MEDIAN: '3.09'
           HC_INPUT_CSV:       pipeline/latest_posts.csv
           HC_FOLLOWERS:       '485000'
         run: python pipeline/baseline_check.py
