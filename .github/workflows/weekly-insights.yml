@@ -1,358 +1,137 @@
-# pipeline/baseline_check.py
-# --------------------------------
-import os
-import json
-import time
-import traceback
-import requests
-import pandas as pd
-from datetime import timedelta
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+name: weekly-insights
 
-load_dotenv()
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
 
-# ---------- ENV ----------
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
-CSV_PATH            = os.getenv("HC_INPUT_CSV", "latest_posts.csv")
-BASELINE_ER         = float(os.getenv("BASELINE_ER_MEDIAN", "0.0"))
-BASELINE_IVR        = float(os.getenv("BASELINE_IVR_MEDIAN", "0.0"))
-FALLBACK_FOLLOWERS  = float(os.getenv("HC_FOLLOWERS", "0"))
-NOTION_TOKEN        = os.getenv("NOTION_TOKEN")
-DB_ID               = os.getenv("NOTION_DB_MASPLUS")
-NOTION_VERSION      = "2022-06-28"
+permissions:
+  contents: read
 
-# ---------- OpenAI territory classifier (optional) ----------
-TERRITORY_LABELS = [
-    "Football / Messi Baseline",
-    "Future Clarity",
-    "Performance Mastery",
-    "Creative Momentum",
-]
+concurrency:
+  group: weekly-insights-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-TERRITORY_DEFS = """
-You are classifying Instagram posts into one of four brand territories:
+jobs:
+  weekly_job:
+    runs-on: ubuntu-latest
 
-1) Football / Messi Baseline
-   - Match moments, Messi presence, team, on-pitch cues, kits, in-stadium energy.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-2) Future Clarity
-   - Product, design/identity, macro visuals, clean setups, clarity of message, aesthetic focus.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-3) Performance Mastery
-   - Discipline, routine, training, hydration rituals, pre-game/post-game focus, mindset.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-4) Creative Momentum
-   - Culture-native formats, creator POV, humor, trends, collabs, social-first challenges, ambient lifestyle.
+      - name: Fetch MAS+ data from Apify (async poll)
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p pipeline
+          OUT_RAW="pipeline/latest_posts_raw.csv"
+          RUN_JSON="pipeline/apify_run.json"
 
-Rules:
-- Return ONLY the label string (exactly one of the four).
-- Use caption text, visible format cues (reel/image), and any short metadata provided.
-- If ambiguous, choose the best-fit by intended audience frame (not just literal nouns).
-"""
+          JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":30,"proxy":{"useApifyProxy":true}}'
 
-def _fewshot_from_existing(df):
-    shots = []
-    if "Assigned_Territory_v4" in df.columns:
-        ex = df.dropna(subset=["Assigned_Territory_v4"]).head(4)
-        for _, r in ex.iterrows():
-            cap = str(r.get("caption_v4") or r.get("caption_v3") or r.get("caption") or "")[:300]
-            fmt = str(r.get("format_v4") or r.get("format_v3") or r.get("format") or "")
-            lab = str(r.get("Assigned_Territory_v4"))
-            shots.append(f"Caption: {cap}\nFormat: {fmt}\n-> {lab}")
-    return "\n\n".join(shots)
+          # Start run (async)
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${APIFY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
+            -d "${JSON_PAYLOAD}" \
+            -o "${RUN_JSON}"
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=1, max=8), retry=retry_if_exception_type(Exception))
-def _classify_one(openai_client, caption, fmt):
-    prompt = f"""{TERRITORY_DEFS}
+          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
+          if [ -z "${RUN_ID}" ]; then
+            echo "Failed to start Apify run."
+            sed -n '1,200p' "${RUN_JSON}" || true
+            exit 1
+          fi
+          echo "Apify run started: ${RUN_ID}"
 
-Few-shot examples (from known posts):
-{_fewshot_from_existing(df)}
+          # Poll until SUCCEEDED
+          while :; do
+            RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
+            STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
+            echo "  status: ${STATUS}"
+            if [ "${STATUS}" = "SUCCEEDED" ]; then
+              break
+            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED-OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
+              echo "Run ended with status: ${STATUS}"
+              printf "%s\n" "${RESP}" | sed -n '1,200p'
+              exit 1
+            fi
+            sleep 30
+          done
 
-Now classify this post into exactly one label:
-Caption: {caption[:500]}
-Format: {fmt}
+          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
+          if [ -z "${DATASET_ID}" ]; then
+            echo "No dataset id found."
+            printf "%s\n" "${RESP}" | sed -n '1,200p'
+            exit 1
+          fi
 
-Answer with ONLY one of:
-- Football / Messi Baseline
-- Future Clarity
-- Performance Mastery
-- Creative Momentum
-"""
-    from openai import OpenAI
-    resp = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    text = resp.choices[0].message.content.strip()
-    for lab in TERRITORY_LABELS:
-        if lab.lower() in text.lower():
-            return lab
-    return "Future Clarity"
+          curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
+          if [ ! -s "${OUT_RAW}" ]; then
+            echo "Downloaded CSV is empty."
+            exit 1
+          fi
 
-def classify_missing_territories(df):
-    """Fill Assigned_Territory_v4 for recent rows (last 60d) if missing."""
-    try:
-        from openai import OpenAI
-        if not OPENAI_API_KEY:
-            print("⚠️ OPENAI_API_KEY not set; skipping classification.")
-            return df
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print("⚠️ OpenAI client error; skipping classification.", e)
-        return df
+          echo "Raw CSV preview:"
+          head -5 "${OUT_RAW}"
 
-    global dt_series
-    if 'dt_series' not in globals():
-        return df
+      - name: Normalize CSV for baseline_check.py
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          src = "pipeline/latest_posts_raw.csv"
+          dst = "pipeline/latest_posts.csv"
+          df = pd.read_csv(src)
 
-    cutoff_cls = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=60)
-    mask_recent = dt_series >= cutoff_cls
+          lower = {c.lower(): c for c in df.columns}
+          candidates = ["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
+          col = next((lower[c] for c in candidates if c in lower), None)
+          if col is None:
+            raise SystemExit(f"No date-like column found. Columns: {list(df.columns)}")
 
-    terr_col = None
-    for c in ["Assigned_Territory_v4", "Assigned_Territory_v3"]:
-        if c in df.columns:
-            terr_col = c
-            break
-    if terr_col is None:
-        terr_col = "Assigned_Territory_v4"
-        df[terr_col] = pd.Series([None]*len(df))
+          s = df[col]
+          d = pd.to_datetime(s, errors="coerce", utc=True)
+          if d.isna().all():
+            d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="s", utc=True)
+            if d.isna().all():
+              d = pd.to_datetime(pd.to_numeric(s, errors="coerce"), unit="ms", utc=True)
+          if d.isna().all():
+            raise SystemExit(f"Could not parse dates from column {col}")
 
-    missing = mask_recent & df[terr_col].isna()
-    if missing.sum() == 0:
-        print("No missing territories to classify.")
-        return df
+          df["date_v4"] = d.dt.strftime("%Y-%m-%d")
 
-    if "Assigned_Territory_v4_pred" not in df.columns:
-        df["Assigned_Territory_v4_pred"] = pd.Series([None]*len(df))
+          ren = {}
+          if "shortcode" in lower: ren[lower["shortcode"]] = "shortCode"
+          if "short_code" in lower: ren[lower["short_code"]] = "shortCode"
+          if "url" in lower: ren[lower["url"]] = "postUrl"
+          df = df.rename(columns=ren)
 
-    preds = []
-    for idx in df[missing].index:
-        cap = str(
-            df.at[idx, "caption_v4"] if "caption_v4" in df.columns else
-            df.at[idx, "caption_v3"] if "caption_v3" in df.columns else
-            df.at[idx, "caption"] if "caption" in df.columns else ""
-        )
-        fmt = str(
-            df.at[idx, "format_v4"] if "format_v4" in df.columns else
-            df.at[idx, "format_v3"] if "format_v3" in df.columns else
-            df.at[idx, "format"] if "format" in df.columns else ""
-        )
-        try:
-            lab = _classify_one(client, cap, fmt)
-        except Exception as e:
-            print("⚠️ classify error, defaulting:", e)
-            lab = "Future Clarity"
-        preds.append((idx, lab))
-        time.sleep(0.2)
+          df.to_csv(dst, index=False)
+          print("Normalized columns:", list(df.columns))
+          print(df.head(5).to_string())
+          PY
 
-    for idx, lab in preds:
-        df.at[idx, "Assigned_Territory_v4_pred"] = lab
-        if pd.isna(df.at[idx, terr_col]):
-            df.at[idx, terr_col] = lab
-
-    try:
-        df.to_csv("enriched_latest_posts.csv", index=False)
-        print("Saved enriched file with predictions -> enriched_latest_posts.csv")
-    except Exception as e:
-        print("⚠️ could not save enriched file:", e)
-
-    return df
-
-# ---------- Load CSV ----------
-if not os.path.exists(CSV_PATH):
-    raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
-df = pd.read_csv(CSV_PATH)
-
-# ---------- Column picking ----------
-cols = {c.lower().strip(): c for c in df.columns}
-def pick(*cands, required=False):
-    for c in cands:
-        if c.lower() in cols:
-            return cols[c.lower()]
-    if required:
-        raise ValueError(f"CSV missing required column: {cands}")
-    return None
-
-DATE_COL      = pick("date_v4","date_v3","date", required=True)
-LIKES_COL     = pick("total_likes_v4","total_likes_v3","likes")
-COMMENTS_COL  = pick("total_comments_v4","total_comments_v3","comments")
-VIEWS_COL     = pick("total_views_v4","total_views_v3","views")
-ER_COL        = pick("er_v4","er_v3","er")
-IVR_COL       = pick("ivr_v4","ivr_v3","ivr")
-URL_COL       = pick("url","permalink","link")
-FOLLOWERS_COL = pick("followers","follower_count")
-
-print("Columns used ->",
-      "DATE:", DATE_COL,
-      "| LIKES:", LIKES_COL,
-      "| COMMENTS:", COMMENTS_COL,
-      "| VIEWS:", VIEWS_COL,
-      "| FOLLOWERS:", FOLLOWERS_COL,
-      "| ER:", ER_COL,
-      "| IVR:", IVR_COL,
-      "| URL:", URL_COL or "—")
-
-def to_num(x):
-    try:
-        if isinstance(x,str):
-            x = x.replace(",","").replace("%","").strip()
-        return float(x)
-    except Exception:
-        return float("nan")
-
-# ---------- Parse dates ----------
-dt_series = pd.to_datetime(df[DATE_COL], utc=True, errors="coerce")
-valid = dt_series.notna()
-df = df.loc[valid].copy()
-dt_series = dt_series.loc[valid]
-
-# ---------- Classify territories (optional) ----------
-df = classify_missing_territories(df)
-
-# ---------- Compute metrics ----------
-df["likes"]    = df[LIKES_COL].apply(to_num)    if LIKES_COL else 0.0
-df["comments"] = df[COMMENTS_COL].apply(to_num) if COMMENTS_COL else 0.0
-if VIEWS_COL: df["views"] = df[VIEWS_COL].apply(to_num)
-
-if FOLLOWERS_COL:
-    df["followers"] = df[FOLLOWERS_COL].apply(to_num)
-else:
-    df["followers"] = FALLBACK_FOLLOWERS
-
-if ER_COL:
-    df["ER"] = df[ER_COL].apply(to_num)
-else:
-    df["ER"] = ((df["likes"]+df["comments"])/df["followers"].replace(0,pd.NA))*100
-
-if IVR_COL:
-    df["IVR"] = df[IVR_COL].apply(to_num)
-elif "views" in df.columns:
-    df["IVR"] = ((df["likes"]+df["comments"])/df["views"].replace(0,pd.NA))*100
-
-# ---------- 30-day window ----------
-cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=30)
-mask = dt_series >= cutoff
-latest = df.loc[mask].copy()
-if latest.empty:
-    print("No posts in the last 30 days.")
-    raise SystemExit(0)
-
-latest["__date"] = dt_series.loc[mask].dt.strftime("%Y-%m-%d")
-
-# ---------- Outliers & medians ----------
-er_p95 = latest["ER"].quantile(0.95)
-latest_no_outliers = latest[latest["ER"] <= er_p95].copy()
-
-er_med  = float(latest_no_outliers["ER"].median(skipna=True))
-ivr_med = float(latest_no_outliers["IVR"].median(skipna=True)) if "IVR" in latest_no_outliers.columns else float("nan")
-
-er_delta  = er_med - BASELINE_ER
-ivr_delta = ivr_med - BASELINE_IVR if pd.notna(ivr_med) else float("nan")
-
-def fmt(x):     return "—" if pd.isna(x) else f"{x:.2f}"
-def fmt_pts(x): return "—" if pd.isna(x) else f"{x:.2f}"
-
-print("\nMAS+ Instagram — Movement vs Baseline (last 30 days)\n")
-print(f"Baseline: ER {BASELINE_ER:.2f}% | IVR {BASELINE_IVR:.2f}%")
-print(f"Latest 30 d: ER {fmt(er_med)}% | IVR {fmt(ivr_med)}%")
-print(f"Δ vs baseline: ER {fmt_pts(er_delta)} pts | IVR {fmt_pts(ivr_delta)} pts\n")
-
-# ---------- Top/bottom posts ----------
-latest["ER_uplift_pts"] = latest["ER"] - BASELINE_ER
-def show(rows,title):
-    print(title)
-    for _,r in rows.iterrows():
-        print(f" - {r['__date']} | ER {fmt(r['ER'])}% | Δ {fmt(r['ER_uplift_pts'])} pts | {r.get(URL_COL,'')}")
-    print()
-
-show(latest.sort_values("ER_uplift_pts",ascending=False).head(3),"Top by ER uplift:")
-show(latest.sort_values("ER_uplift_pts",ascending=True).head(3),"Bottom by ER uplift:")
-
-# ---------- Notion helpers ----------
-def rt(text):  # rich_text
-    return {"rich_text": [{"type": "text", "text": {"content": str(text)[:1900]}}]}
-
-def ttl(text):  # title
-    return {"title": [{"type": "text", "text": {"content": str(text)[:200]}}]}
-
-def sel(name):
-    return {"select": {"name": name}}
-
-def notion_create(properties):
-    if not NOTION_TOKEN or not DB_ID:
-        print("⚠️ Missing NOTION_TOKEN or NOTION_DB_MASPLUS — skipping Notion write.")
-        return
-    url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-    payload = {"parent": {"database_id": DB_ID}, "properties": properties}
-    r = requests.post(url, headers=headers, data=json.dumps(payload))
-    if r.status_code >= 300:
-        print("❌ Notion create error:", r.status_code, r.text)
-    else:
-        print("✅ Notion page created.")
-
-def notion_update(page_id, properties):
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": NOTION_VERSION,
-        "Content-Type": "application/json",
-    }
-    r = requests.patch(url, headers=headers, data=json.dumps({"properties": properties}))
-    if r.status_code >= 300:
-        print("❌ Notion update error:", r.status_code, r.text)
-    else:
-        print("✅ Notion page updated.")
-
-# ---------- Weekly Pulse page (always-create: no Notion query at all) ----------
-headline_line = f"ER {fmt_pts(er_delta)} pts vs baseline | IVR {fmt_pts(ivr_delta)} pts"
-detail_line   = f"ER {fmt(er_med)}% (base {BASELINE_ER:.2f}%) • IVR {fmt(ivr_med)}% (base {BASELINE_IVR:.2f}%)"
-
-if er_delta > 0 and (pd.notna(ivr_delta) and ivr_delta < 0):
-    summary = "Broader reach but lower depth — test 12–15s Reels with stronger first-frame hook."
-elif er_delta > 0:
-    summary = "Positive lift; maintain momentum on current creative focus."
-else:
-    summary = "Engagement softness; review hook clarity and emotional framing."
-summary += " (95th-percentile outliers removed for the ER median)."
-
-if "Assigned_Territory_v4" in df.columns:
-    tcol = "Assigned_Territory_v4"
-    latest_no = latest_no_outliers if "latest_no_outliers" in locals() else latest
-    g = latest_no.groupby(tcol)["ER"].median().sort_values(ascending=False).head(3)
-    top_terr = "; ".join([f"{k}: {v:.2f}%" for k, v in g.items()])
-    summary += f" Top territories (ER median, 30 d): {top_terr}."
-
-pulse_props = {
-    "Date": {"date": {"start": pd.Timestamp.utcnow().strftime("%Y-%m-%d")}},
-    "Insight Type": sel("Weekly Pulse"),
-    "Headline": rt(headline_line),
-    "Metric": rt(f"{fmt_pts(er_delta)} pts"),
-    "Confidence": sel("High" if abs(er_delta) >= 0.20 else "Medium"),
-    "Status": sel("Published"),
-    "Action": rt(f"{detail_line}\n{summary}"),
-    "Title": ttl("Weekly Pulse"),
-}
-
-# Always create (no query → no IndexError)
-notion_create(pulse_props)
-
-# ---------- Predictive Test (always-create if IVR softened) ----------
-if pd.notna(ivr_delta) and ivr_delta < 0:
-    pred_props = {
-        "Date": {"date": {"start": pd.Timestamp.utcnow().strftime("%Y-%m-%d")}},
-        "Insight Type": sel("Predictive Test"),
-        "Headline": rt("Predictive Test — Lift IVR via first-frame hook + 12–15s"),
-        "Metric": rt("10–15%"),
-        "Confidence": sel("Medium"),
-        "Status": sel("Published"),
-        "Action": rt(f"IVR {fmt(ivr_med)}% vs base {BASELINE_IVR:.2f}%. Test: macro first frame, motion in 0.5s, question opener; 12–15s."),
-        "Title": ttl("Predictive Test"),
-    }
-    notion_create(pred_props)
+      - name: Run baseline to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASELINE_ER_MEDIAN: '0.95'
+          BASELINE_IVR_MEDIAN: '3.09'
+          HC_INPUT_CSV: pipeline/latest_posts.csv
+          HC_FOLLOWERS: '485000'
+          NOTION_CREATE_IF_MISSING: '1'
+        run: python pipeline/baseline_check.py
