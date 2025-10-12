@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
-            - name: Fetch latest MAS+ data from Apify (run → poll → download)
+      - name: Fetch latest MAS+ data from Apify (start → poll → download)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
@@ -35,112 +35,74 @@ jobs:
           OUT="pipeline/latest_posts.csv"
           RUN_JSON="pipeline/apify_run.json"
 
-          # 1) Start actor run (returns 201 + run JSON)
-          JSON_PAYLOAD=$(cat <<'JSON'
-          {
+          # 1) Start the actor run (returns 201 + run JSON)
+          JSON_PAYLOAD='{
             "username": ["masbymessi"],
             "maxItems": 30,
             "proxy": { "useApifyProxy": true }
-          }
-          JSON
-          )
+          }'
+
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
-            -d "$JSON_PAYLOAD" > "$RUN_JSON"
+            -d "${JSON_PAYLOAD}" > "${RUN_JSON}"
 
-          # 2) Extract runId and poll status until SUCCEEDED (timeout ~6 min)
-          RUN_ID=$(python - <<'PY' "$RUN_JSON"
-import json,sys
-d=json.load(open(sys.argv[1]))
-print(d.get("data",{}).get("id",""))
-PY
-)
-          if [ -z "$RUN_ID" ]; then
+          # 2) Extract runId
+          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
+          if [ -z "${RUN_ID}" ]; then
             echo "Failed to start Apify run. Response:"
-            sed -n '1,200p' "$RUN_JSON" || true
+            sed -n '1,200p' "${RUN_JSON}" || true
             exit 1
           fi
 
-          echo "Apify run started: $RUN_ID — polling…"
-          MAX_TRIES=72   # 72 * 5s ≈ 6 minutes
+          echo "Apify run started: ${RUN_ID} — polling…"
+
+          # 3) Poll status until SUCCEEDED (max ~6 minutes)
+          MAX_TRIES=72   # 72 * 5s
           i=0
           STATUS=""
-          while [ $i -lt $MAX_TRIES ]; do
+          RESP=""
+          while [ ${i} -lt ${MAX_TRIES} ]; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" \
               "https://api.apify.com/v2/actor-runs/${RUN_ID}")
-            STATUS=$(python - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("data",{}).get("status",""))
-PY
-)
-            echo "  status: $STATUS"
-            case "$STATUS" in
+            STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))')
+            echo "  status: ${STATUS}"
+            case "${STATUS}" in
               SUCCEEDED) break;;
               FAILED|TIMED-OUT|ABORTED)
-                echo "Run ended with status: $STATUS"
-                echo "$RESP" | sed -n '1,200p'
+                echo "Run ended with status: ${STATUS}"
+                printf "%s\n" "${RESP}" | sed -n '1,200p'
                 exit 1;;
             esac
             sleep 5
             i=$((i+1))
           done
 
-          if [ "$STATUS" != "SUCCEEDED" ]; then
-            echo "Timeout waiting for run to finish."
+          if [ "${STATUS}" != "SUCCEEDED" ]; then
+            echo "Timeout waiting for Apify run to finish."
             exit 1
           fi
 
-          # 3) Get defaultDatasetId and download CSV
-          DATASET_ID=$(echo "$RESP" | python - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("data",{}).get("defaultDatasetId",""))
-PY
-)
-          if [ -z "$DATASET_ID" ]; then
+          # 4) Get defaultDatasetId and download CSV
+          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
+          if [ -z "${DATASET_ID}" ]; then
             echo "No dataset id found. Full run object:"
-            echo "$RESP" | sed -n '1,200p'
+            printf "%s\n" "${RESP}" | sed -n '1,200p'
             exit 1
           fi
 
           curl -sS \
             "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -o "$OUT"
+            -o "${OUT}"
 
-          if [ ! -s "$OUT" ]; then
+          if [ ! -s "${OUT}" ]; then
             echo "Downloaded CSV is empty."
             exit 1
           fi
 
           echo "CSV preview:"
-          head -5 "$OUT"
-
-          HTTP_CODE=$(curl -sS \
-            -H "Authorization: Bearer ${APIFY_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
-            -d "$JSON_PAYLOAD" \
-            -o "$OUT" \
-            -w "%{http_code}" || true)
-
-          if [ "${HTTP_CODE:-}" != "200" ] || [ ! -s "$OUT" ]; then
-            echo "Apify returned HTTP ${HTTP_CODE:-none}"
-            echo "Response:"
-            curl -sS \
-              -H "Authorization: Bearer ${APIFY_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
-              -d "$JSON_PAYLOAD" | sed -n '1,200p' || true
-            exit 1
-          fi
-
-          echo "CSV preview:"
-          head -5 "$OUT" || true
+          head -5 "${OUT}"
 
       - name: Run baseline → Notion
         env:
