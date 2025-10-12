@@ -31,44 +31,67 @@ jobs:
           pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
 
       # ---- Fetch last 7 days of MAS+ posts from Apify (actor, no task id) ----
-      - name: Fetch latest MAS+ data from Apify
+            - name: Fetch latest MAS+ data from Apify
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p pipeline
           OUT="pipeline/latest_posts.csv"
-          ERR="pipeline/apify_error.txt"
+          BODY="pipeline/apify_body.out"
+          CODE="pipeline/apify_code.txt"
+          HDRS="pipeline/apify_headers.txt"
 
-          # Rolling 7-day window (Ubuntu runner has GNU date)
-          FROM_DATE=$(date -u -d '7 days ago' '+%Y-%m-%dT00:00:00.000Z')
+          # Minimal, valid input for apify~instagram-post-scraper
+          JSON_PAYLOAD=$(cat <<'JSON'
+          {
+            "usernames": ["masbymessi"],
+            "resultsLimit": 30,
+            "proxy": { "useApifyProxy": true }
+          }
+          JSON
+          )
 
-          # Use 'usernames' (more widely supported) instead of directUrls
-          JSON_PAYLOAD=$(printf '{"usernames":["masbymessi"],"resultsLimit":30,"scrapePosts":true,"fromDate":"%s"}' "$FROM_DATE")
-
-          # Call official actor; put token in header and query, and capture errors
-          set +e
-          curl -sS -w "\n%{http_code}\n" -X POST \
+          # Call actor and capture everything cleanly
+          HTTP_CODE=$(curl -sS \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
+            -X POST \
+            -D "$HDRS" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=csv&clean=true&token=${APIFY_TOKEN}" \
             -d "$JSON_PAYLOAD" \
-            -o "$OUT" > "$ERR"
-          CODE=$(tail -n1 "$ERR")
-          head -n -1 "$ERR" > "$ERR.body" || true
-          set -e
+            -o "$OUT" \
+            -w "%{http_code}")
 
-          if [ "$CODE" != "200" ]; then
-            echo "Apify returned HTTP $CODE"
+          echo "$HTTP_CODE" > "$CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            # Re-run without file output to capture the JSON error body for debugging
+            curl -sS \
+              -H "Authorization: Bearer ${APIFY_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              "https://api.apify.com/v2/acts/apify~instagram-post-scraper/run-sync-get-dataset-items?format=json&clean=true&token=${APIFY_TOKEN}" \
+              -d "$JSON_PAYLOAD" > "$BODY" || true
+
+            echo "Apify returned HTTP $HTTP_CODE"
             echo "Request payload:"
             echo "$JSON_PAYLOAD"
+            echo "---- Response headers ----"
+            sed -n '1,200p' "$HDRS" || true
             echo "---- Response body ----"
-            cat "$ERR.body" || true
+            sed -n '1,400p' "$BODY" || true
             exit 1
           fi
 
           echo "First lines of downloaded CSV:"
-          head -5 "$OUT"
+          head -5 "$OUT" || true
+
+          # Optional: ensure file is not empty
+          if [ ! -s "$OUT" ]; then
+            echo "Downloaded CSV is empty."
+            exit 1
+          fi
 
       # ---- Analyse → classify → post to Notion ----
       - name: Run baseline → Notion
