@@ -234,9 +234,10 @@ jobs:
           print("Manifest columns:", list(manifest.columns))
           print("Sample rows:\n", manifest.head(10).to_string(index=False))
           PY
-          
-           - name: Download a tiny media sample (3 images, 2 videos)
-          run: |
+
+      # 4) Download a tiny media sample (3 images, 2 videos) from manifest
+      - name: Download a tiny media sample (3 images, 2 videos)
+        run: |
           set -euo pipefail
           python - <<'PY'
           import pandas as pd, os, re, requests
@@ -251,22 +252,24 @@ jobs:
                 return u
             return None
 
-          # pick 3 images + 2 videos based on media_type if present, else by presence of 'video' in URL column name
           def row_is_video(row):
             mt = str(row.get('media_type','')).lower()
-            if mt in ('video', 'true'): return True
-            # fall back: any url column name contains 'video'
+            if mt in ('video', 'true'): 
+              return True
+            # fallback: any url column name contains 'video'
             return any('video' in c.lower() for c in url_cols)
 
           imgs, vids = [], []
           for _, r in m.iterrows():
             u = first_url(r)
-            if not u: continue
+            if not u: 
+              continue
             if row_is_video(r):
               if len(vids) < 2: vids.append(u)
             else:
               if len(imgs) < 3: imgs.append(u)
-            if len(imgs) >= 3 and len(vids) >= 2: break
+            if len(imgs) >= 3 and len(vids) >= 2: 
+              break
 
           print("Selected images:", imgs)
           print("Selected videos:", vids)
@@ -292,18 +295,18 @@ jobs:
             dl(u, f"media_sample/vid_{i}{ext}")
           PY
 
-
-      # 4) Upload artifacts so you can inspect results locally
-      - name: Upload raw, normalised & manifest CSVs (artifacts)
+      # 5) Upload artifacts so you can inspect everything locally
+      - name: Upload raw, normalised, manifest & media sample (artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: apify_csvs_and_manifest
+          name: apify_csvs_manifest_and_media_sample
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
             pipeline/media_manifest.csv
+            media_sample
 
-      # 5) (Optional) Run your baseline script as before
+      # 6) (Optional) Run your baseline script as before
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
