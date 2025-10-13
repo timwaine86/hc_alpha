@@ -314,12 +314,14 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, base64, glob, pandas as pd
-          from datetime import datetime
+          import os, base64, glob, pandas as pd, json, re
+          import httpx
           from tenacity import retry, stop_after_attempt, wait_exponential
           from openai import OpenAI
 
-          client = OpenAI()
+          # Build an explicit HTTP client that IGNORES env proxies
+          http_client = httpx.Client(trust_env=False, timeout=60)
+          client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), http_client=http_client)
 
           MOTIF_LABELS = [
             "Product Macro",
@@ -345,15 +347,12 @@ jobs:
             return {"type":"input_image", "image_url":{"url": f"data:image/jpeg;base64,{b64}"}}
 
           @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
-          def classify_frames(sc, frame_paths):
+          def classify_frames(frame_paths):
             content = [{"type":"input_text","text":SYSTEM}]
-            # add up to 3 frames: first, middle, last
-            picks = []
             if frame_paths:
               picks = [frame_paths[0], frame_paths[len(frame_paths)//2], frame_paths[-1]]
-            for p in picks:
-              content.append(enc_img(p))
-            # fallback: if somehow no frames, still call with text
+              for p in picks:
+                content.append(enc_img(p))
             resp = client.chat.completions.create(
               model="gpt-4o-mini",
               messages=[{"role":"user","content":content}],
@@ -361,7 +360,6 @@ jobs:
             )
             return resp.choices[0].message.content.strip()
 
-          # walk frames folders
           rows=[]
           for sc_dir in sorted(glob.glob("frames_video/*")):
             if not os.path.isdir(sc_dir): continue
@@ -369,11 +367,10 @@ jobs:
             frames = sorted(glob.glob(os.path.join(sc_dir,"frame_*.jpg")))
             if not frames: continue
             try:
-              result = classify_frames(sc, frames)
+              result = classify_frames(frames)
             except Exception as e:
               result = '{"motif":"Lifestyle / Environment","confidence":0.5,"reason":"fallback"}'
               print("⚠️ classify error for", sc, e)
-
             rows.append({"shortCode": sc, "result": result})
 
           out = "pipeline/motif_results.csv"
@@ -382,7 +379,6 @@ jobs:
           PY
 
       # 5) Publish weekly visual narrative to Notion (one card, per-post list)
-        # Creates "Weekly Motifs" entry: headline + summary + per-post bullets
       - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -408,16 +404,15 @@ jobs:
           posts = pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
           motifs = pd.read_csv("pipeline/motif_results.csv") if os.path.exists("pipeline/motif_results.csv") else pd.DataFrame(columns=["shortCode","result"])
 
-          # parse model JSON strings
           def parse_json(s):
             try:
               j = json.loads(s)
               if isinstance(j,str): j=json.loads(j)
               return j
             except Exception:
-              # best-effort extract motif label
               m = re.search(r'"motif"\s*:\s*"([^"]+)"', str(s))
               return {"motif": m.group(1) if m else "Lifestyle / Environment", "confidence": 0.5, "reason":"parsed"}
+
           motifs_parsed = []
           for _,r in motifs.iterrows():
             obj = parse_json(r["result"])
@@ -428,7 +423,6 @@ jobs:
           week = datetime.now(timezone.utc).strftime("%Y-%m-%d")
           merged = posts.merge(motifs_df, on="shortCode", how="left")
 
-          # quick caption intent (text-only, light heuristic here to keep things simple for now)
           def intent_from_caption(c):
             c = str(c or "").lower()
             if any(k in c for k in ["vote","which","choose","rate","drop","comment"]): return "Participation / Prompt"
@@ -437,13 +431,11 @@ jobs:
             return "Celebration / Moment"
           merged["intent"] = merged["caption"].map(intent_from_caption)
 
-          # headline & summary
           motif_counts = merged["motif"].value_counts(dropna=False).to_dict()
           motif_line = " • ".join([f"{k}: {v}" for k,v in motif_counts.items()])
           headline = f"Weekly Visual Motifs — {week}"
           summary  = f"Posts: {len(merged)} | Motifs: {motif_line}"
 
-          # build per-post bullets
           bullets=[]
           for _,r in merged.iterrows():
             bullets.append(f"- {r.get('date_v4','?')} | {r.get('shortCode','')} | Motif: {r.get('motif','?')} | Intent: {r.get('intent','?')} | {r.get('postUrl','')}")
@@ -470,7 +462,7 @@ jobs:
             print("✅ Notion page created.")
           PY
 
-      # 6) Upload artifacts (CSVs, videos, frames, motif results)
+      # 6) Upload artifacts (CSVs, videos, frames, motifs)
       - name: Upload artifacts (csvs, videos, frames, motifs)
         uses: actions/upload-artifact@v4
         with:
@@ -482,7 +474,7 @@ jobs:
             frames_video
             pipeline/motif_results.csv
 
-      # 7) (Optional) Baseline to Notion (your existing weekly pulse)
+      # 7) (Optional) Baseline to Notion
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
