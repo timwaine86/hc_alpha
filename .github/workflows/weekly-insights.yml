@@ -28,7 +28,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity numpy
+          pip install pandas python-dateutil python-dotenv requests numpy openai==1.51.2 tenacity
+          # video tools
+          pip install yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       # 1) Start Apify actor (async) -> poll until SUCCEEDED -> download CSV
       - name: Fetch MAS+ data from Apify (async poll)
@@ -42,7 +46,6 @@ jobs:
 
           JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":30,"proxy":{"useApifyProxy":true}}'
 
-          # Start run (async)
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -58,7 +61,6 @@ jobs:
           fi
           echo "Apify run started: ${RUN_ID}"
 
-          # Poll until SUCCEEDED
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
@@ -89,7 +91,7 @@ jobs:
           echo "Raw CSV preview:"
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize: keep only real parent posts, add date_v4, dedupe, keep latest 30, tidy columns
+      # 2) Normalize: parent posts only, add date_v4, dedupe by shortcode, latest 30
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -98,15 +100,12 @@ jobs:
           src = "pipeline/latest_posts_raw.csv"
           dst = "pipeline/latest_posts.csv"
 
-          # Read as string to avoid coercions
           df = pd.read_csv(src, dtype=str, keep_default_na=False)
 
-          # Helper to map case-insensitive column names
           lower = {c.lower(): c for c in df.columns}
           def col(*names):
             for n in names:
-              if n.lower() in lower:
-                return lower[n.lower()]
+              if n.lower() in lower: return lower[n.lower()]
             return None
 
           sc_col   = col("shortCode","short_code","shortcode")
@@ -120,74 +119,49 @@ jobs:
           disp_col = col("displayUrl","imageUrl","thumbnailUrl","display_url")
           vid_col  = col("videoUrl","video_url")
 
-          def nonempty(s):
-            return s.astype(str).str.strip().ne("") if s is not None else pd.Series(False, index=df.index)
+          def nonempty(s): return s.astype(str).str.strip().ne("") if s is not None else pd.Series(False, index=df.index)
 
-          # Keep only rows with a shortcode AND a timestamp (parent posts, not child rows)
-          if not sc_col or not ts_col:
-            raise SystemExit("Missing required columns for normalization (shortCode/timestamp).")
-          mask_parent = nonempty(df[sc_col]) & nonempty(df[ts_col])
-          dfp = df.loc[mask_parent].copy()
+          if not sc_col or not ts_col: raise SystemExit("Missing shortCode/timestamp.")
+          dfp = df.loc[nonempty(df[sc_col]) & nonempty(df[ts_col])].copy()
 
-          # Parse timestamp -> datetime (UTC), derive date_v4
           dt = pd.to_datetime(dfp[ts_col], errors="coerce", utc=True)
           dfp = dfp.loc[dt.notna()].copy()
           dfp["__dt"] = dt.loc[dt.notna()]
           dfp["date_v4"] = dfp["__dt"].dt.strftime("%Y-%m-%d")
 
-          # Build per-shortCode rows, taking first non-empty value per field
           keep_cols = {
-            "shortCode": sc_col,
-            "postUrl": url_col,
-            "caption": cap_col,
-            "type": type_col,
-            "likesCount": like_col,
-            "commentsCount": com_col,
-            "videoViewCount": vvc_col,
-            "displayUrl": disp_col,
-            "videoUrl": vid_col,
-            "date_v4": "date_v4",
-            "__dt": "__dt",
+            "shortCode": sc_col, "postUrl": url_col, "caption": cap_col, "type": type_col,
+            "likesCount": like_col, "commentsCount": com_col, "videoViewCount": vvc_col,
+            "displayUrl": disp_col, "videoUrl": vid_col, "date_v4": "date_v4", "__dt": "__dt",
           }
 
           def first_nonempty(series):
             for v in series:
               s = str(v) if pd.notna(v) else ""
-              if s.strip():
-                return s
+              if s.strip(): return s
             return ""
 
-          grouped = []
+          rows=[]
           for sc, grp in dfp.groupby(sc_col):
-            row = {}
+            row={}
             for out, src_col in keep_cols.items():
-              if src_col not in grp.columns:
-                row[out] = ""
-              else:
-                row[out] = first_nonempty(grp[src_col])
-            # views from videoViewCount if present
+              row[out] = first_nonempty(grp[src_col]) if (src_col in grp.columns) else ""
             vvc = row.get("videoViewCount","")
             if vvc != "":
-              try:
-                row["views"] = str(int(float(vvc)))
-              except:
-                row["views"] = vvc
+              try: row["views"] = str(int(float(vvc)))
+              except: row["views"] = vvc
             else:
               row["views"] = ""
-            grouped.append(row)
+            rows.append(row)
 
-          clean = pd.DataFrame(grouped)
-
-          # Sort by datetime desc and limit to latest 30
+          clean = pd.DataFrame(rows)
           clean["__dt"] = pd.to_datetime(clean["__dt"], errors="coerce", utc=True)
           clean = clean.sort_values("__dt", ascending=False).head(30).reset_index(drop=True)
 
-          # Final tidy columns (IG-clean style)
           final_cols = ["date_v4","shortCode","postUrl","type","caption",
                         "likesCount","commentsCount","views","displayUrl","videoUrl"]
           for c in final_cols:
-            if c not in clean.columns:
-              clean[c] = ""
+            if c not in clean.columns: clean[c] = ""
           clean = clean[final_cols]
 
           clean.to_csv(dst, index=False)
@@ -196,7 +170,7 @@ jobs:
           print(clean.head(10).to_string(index=False))
           PY
 
-      # 3) Create a media manifest (no downloads yet) so you can inspect media columns
+      # 3) Media manifest (no downloads yet)
       - name: Create media manifest (no downloads yet)
         run: |
           python - <<'PY'
@@ -205,16 +179,14 @@ jobs:
           raw = pd.read_csv("pipeline/latest_posts_raw.csv")
           clean = pd.read_csv("pipeline/latest_posts.csv")
 
-          def find(cols, pattern):
-            return [c for c in cols if re.search(pattern, c, re.I)]
+          def find(cols, pat): return [c for c in cols if re.search(pat, c, re.I)]
 
           url_cols  = find(raw.columns, r'(display|image|thumb|media|video).*url$|^url$')
           type_cols = find(raw.columns, r'(is|media).*video|product.*type|type$')
           id_cols   = find(raw.columns, r'shortcode$|^short[_]?code$|postid$|id$')
-
           id_col = id_cols[0] if id_cols else None
 
-          media_type = None
+          media_type=None
           if type_cols:
             t = raw[type_cols[0]].astype(str).str.lower()
             media_type = t.map(lambda x: 'video' if ('true' in x or 'video' in x) else 'image')
@@ -222,104 +194,89 @@ jobs:
           out = {}
           out['post_id']    = raw[id_col] if id_col else pd.Series(range(len(raw)))
           out['media_type'] = media_type if media_type is not None else pd.Series(['unknown']*len(raw))
+          for c in url_cols: out[c] = raw[c]
+          out['shortCode']  = clean.get('shortCode')
 
-          for c in url_cols:
-            out[c] = raw[c]
-
-          out['shortCode'] = clean.get('shortCode')
-
-          manifest = pd.DataFrame(out)
-          manifest.to_csv("pipeline/media_manifest.csv", index=False)
-
-          print("Manifest columns:", list(manifest.columns))
-          print("Sample rows:\n", manifest.head(10).to_string(index=False))
+          pd.DataFrame(out).to_csv("pipeline/media_manifest.csv", index=False)
           PY
 
-      # 4) Download a tiny media sample (3 images, 2 videos), only if real JPEG/MP4
-      - name: Download a tiny media sample (3 images, 2 videos)
+      # 4) Download up to 5 IG videos with yt-dlp from postUrl, then extract 10 frames per video
+      - name: Download IG videos (yt-dlp) and extract 10 frames each
         run: |
           set -euo pipefail
           python - <<'PY'
-          import pandas as pd, os, requests
+          import os, subprocess, shlex, pandas as pd, math, json
 
-          m = pd.read_csv("pipeline/media_manifest.csv")
+          os.makedirs("media_video", exist_ok=True)
+          os.makedirs("frames_video", exist_ok=True)
 
-          prefer_video = ("videourl","videourlhd","video_url","video_url_hd")
-          prefer_image = ("displayurl","imageurl","thumbnailurl","display_url","image_url","thumbnail_url")
+          df = pd.read_csv("pipeline/latest_posts.csv")
+          urls = []
+          # Prefer rows likely to be videos: if 'videoUrl' populated OR type hints at video; else just use postUrl
+          for _, r in df.iterrows():
+            u = str(r.get("postUrl") or "").strip()
+            if u.startswith("http"): urls.append(u)
+          # Deduplicate while preserving order
+          seen=set(); urls=[u for u in urls if not (u in seen or seen.add(u))]
 
-          def pick_first(row, preferred, any_url_cols):
-            # try preferred column names first
-            for p in preferred:
-              if p in row.index and isinstance(row[p], str) and row[p].startswith("http"):
-                return row[p]
-            # else fall back to any column that looks like a URL
-            for c in any_url_cols:
-              v = row.get(c)
-              if isinstance(v, str) and v.startswith("http"):
-                return v
-            return None
+          # Try to download up to 5 videos
+          downloaded = []
+          for u in urls:
+            if len(downloaded) >= 5: break
+            print("Attempting video download:", u)
+            # Best effort MP4; yt-dlp will pick the right extractor
+            cmd = f"yt-dlp -S ext:mp4:m4a --no-warnings -o 'media_video/%(id)s.%(ext)s' {shlex.quote(u)}"
+            rc = subprocess.run(cmd, shell=True).returncode
+            if rc == 0:
+              # pick the newest mp4 in the folder as the file we just downloaded
+              mp4s = sorted([f for f in os.listdir('media_video') if f.endswith('.mp4')], key=lambda x: os.path.getmtime(os.path.join('media_video',x)), reverse=True)
+              if mp4s:
+                downloaded.append(os.path.join('media_video', mp4s[0]))
+                print("Downloaded:", downloaded[-1])
+            else:
+              print("yt-dlp failed (non-fatal).")
 
-          url_cols = [c for c in m.columns if "url" in c.lower()]
-          vids, imgs = [], []
+          if not downloaded:
+            print("No videos downloaded; nothing to frame-extract.")
+            raise SystemExit(0)
 
-          # Scan more rows to increase chance of catching fresh MP4s
-          for _, r in m.head(60).iterrows():
-            vu = pick_first(r, prefer_video, url_cols)
-            iu = pick_first(r, prefer_image, url_cols)
-            if iu and len(imgs) < 3:
-              imgs.append(iu)
-            if vu and len(vids) < 2:
-              vids.append(vu)
-            if len(imgs) >= 3 and len(vids) >= 2:
-              break
-
-          print("Selected images:", imgs)
-          print("Selected videos:", vids)
-
-          os.makedirs("media_sample", exist_ok=True)
-          s = requests.Session()
-
-          def save_if_real(url, stem):
+          def probe_duration(path):
             try:
-              with s.get(url, timeout=45, stream=True) as r:
-                if r.status_code != 200:
-                  print(f"Skip ({r.status_code}):", url); return
-                ct = (r.headers.get("Content-Type") or "").lower()
-                if "video/mp4" in ct:
-                  ext = ".mp4"
-                elif "image/jpeg" in ct or "image/jpg" in ct:
-                  ext = ".jpg"
-                else:
-                  print(f"Skip (content-type={ct}):", url); return
-                out = f"media_sample/{stem}{ext}"
-                with open(out, "wb") as f:
-                  for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
-                print("Saved", out)
-            except Exception as e:
-              print("Download failed:", url, e)
+              cmd = ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
+              out = subprocess.check_output(cmd).decode("utf-8").strip()
+              return float(out) if out else None
+            except Exception:
+              return None
 
-          # Download images first (up to 3)
-          for i,u in enumerate(imgs,1):
-            save_if_real(u, f"img_{i}")
-
-          # Download videos next (up to 2)
-          for i,u in enumerate(vids,1):
-            save_if_real(u, f"vid_{i}")
+          # Extract exactly 10 evenly spaced frames per video
+          for vid in downloaded:
+            base = os.path.splitext(os.path.basename(vid))[0]
+            dur = probe_duration(vid)
+            if not dur or dur <= 0:
+              print("Could not probe duration for", vid)
+              continue
+            # 10 timestamps evenly spaced excluding 0 and end
+            stamps = [(i+1)*dur/11 for i in range(10)]
+            for idx, t in enumerate(stamps, 1):
+              out = f"frames_video/{base}_frame_{idx:02d}.jpg"
+              cmd = ["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out]
+              subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              print("Saved frame:", out)
           PY
 
-      # 5) Upload artifacts so you can inspect everything locally
-      - name: Upload raw, normalised, manifest & media sample (artifacts)
+      # 5) Upload artifacts: CSVs, manifest, any downloaded videos, and extracted frames
+      - name: Upload artifacts (csvs, manifest, videos, frames)
         uses: actions/upload-artifact@v4
         with:
-          name: apify_csvs_manifest_and_media_sample
+          name: apify_csvs_media_and_frames
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
             pipeline/media_manifest.csv
-            media_sample
+            media_video
+            frames_video
 
-      # 6) (Optional) Run your baseline script as before
+      # 6) (Optional) Baseline to Notion
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
