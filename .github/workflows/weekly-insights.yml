@@ -235,64 +235,77 @@ jobs:
           print("Sample rows:\n", manifest.head(10).to_string(index=False))
           PY
 
-      # 4) Download a tiny media sample (3 images, 2 videos) from manifest
+      # 4) Download a tiny media sample (3 images, 2 videos), only if real JPEG/MP4
       - name: Download a tiny media sample (3 images, 2 videos)
         run: |
           set -euo pipefail
           python - <<'PY'
-          import pandas as pd, os, re, requests
+          import pandas as pd, os, requests
 
           m = pd.read_csv("pipeline/media_manifest.csv")
-          url_cols = [c for c in m.columns if re.search(r'url', c, re.I)]
 
-          def first_url(row):
-            for c in url_cols:
-              u = str(row.get(c) or '')
-              if u.startswith('http'):
-                return u
+          prefer_video = ("videourl","videourlhd","video_url","video_url_hd")
+          prefer_image = ("displayurl","imageurl","thumbnailurl","display_url","image_url","thumbnail_url")
+
+          def pick_first(row, preferred, any_url_cols):
+            # try preferred column names first
+            for p in preferred:
+              if p in row.index and isinstance(row[p], str) and row[p].startswith("http"):
+                return row[p]
+            # else fall back to any column that looks like a URL
+            for c in any_url_cols:
+              v = row.get(c)
+              if isinstance(v, str) and v.startswith("http"):
+                return v
             return None
 
-          def row_is_video(row):
-            mt = str(row.get('media_type','')).lower()
-            if mt in ('video', 'true'): 
-              return True
-            # fallback: any url column name contains 'video'
-            return any('video' in c.lower() for c in url_cols)
+          url_cols = [c for c in m.columns if "url" in c.lower()]
+          vids, imgs = [], []
 
-          imgs, vids = [], []
-          for _, r in m.iterrows():
-            u = first_url(r)
-            if not u: 
-              continue
-            if row_is_video(r):
-              if len(vids) < 2: vids.append(u)
-            else:
-              if len(imgs) < 3: imgs.append(u)
-            if len(imgs) >= 3 and len(vids) >= 2: 
+          # Scan more rows to increase chance of catching fresh MP4s
+          for _, r in m.head(60).iterrows():
+            vu = pick_first(r, prefer_video, url_cols)
+            iu = pick_first(r, prefer_image, url_cols)
+            if iu and len(imgs) < 3:
+              imgs.append(iu)
+            if vu and len(vids) < 2:
+              vids.append(vu)
+            if len(imgs) >= 3 and len(vids) >= 2:
               break
 
           print("Selected images:", imgs)
           print("Selected videos:", vids)
 
           os.makedirs("media_sample", exist_ok=True)
-          sess = requests.Session()
+          s = requests.Session()
 
-          def dl(url, out):
+          def save_if_real(url, stem):
             try:
-              with sess.get(url, timeout=45, stream=True) as resp:
-                resp.raise_for_status()
+              with s.get(url, timeout=45, stream=True) as r:
+                if r.status_code != 200:
+                  print(f"Skip ({r.status_code}):", url); return
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "video/mp4" in ct:
+                  ext = ".mp4"
+                elif "image/jpeg" in ct or "image/jpg" in ct:
+                  ext = ".jpg"
+                else:
+                  print(f"Skip (content-type={ct}):", url); return
+                out = f"media_sample/{stem}{ext}"
                 with open(out, "wb") as f:
-                  for chunk in resp.iter_content(8192):
+                  for chunk in r.iter_content(8192):
                     if chunk: f.write(chunk)
-              print("Saved", out)
+                print("Saved", out)
             except Exception as e:
               print("Download failed:", url, e)
 
+          # Download images first (up to 3)
           for i,u in enumerate(imgs,1):
-            dl(u, f"media_sample/img_{i}.jpg")
+            save_if_real(u, f"img_{i}")
+
+          # Download videos next (up to 2)
           for i,u in enumerate(vids,1):
-            ext = ".mp4" if ".mp4" in u.lower() else ".bin"
-            dl(u, f"media_sample/vid_{i}{ext}")
+            save_if_real(u, f"vid_{i}")
           PY
 
       # 5) Upload artifacts so you can inspect everything locally
