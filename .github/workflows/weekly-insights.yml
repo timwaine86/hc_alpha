@@ -53,44 +53,28 @@ jobs:
             -o "${RUN_JSON}"
 
           RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          if [ -z "${RUN_ID}" ]; then
-            echo "Failed to start Apify run."
-            sed -n '1,200p' "${RUN_JSON}" || true
-            exit 1
-          fi
+          [ -n "${RUN_ID}" ] || { echo "Failed to start Apify run"; sed -n '1,200p' "${RUN_JSON}"; exit 1; }
           echo "Apify run started: ${RUN_ID}"
 
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
             echo "  status: ${STATUS}"
-            if [ "${STATUS}" = "SUCCEEDED" ]; then
-              break
-            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED-OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
-              echo "Run ended with status: ${STATUS}"
-              printf "%s\n" "${RESP}" | sed -n '1,200p'
-              exit 1
-            fi
+            case "${STATUS}" in
+              SUCCEEDED) break;;
+              FAILED|TIMED-OUT|ABORTED) echo "${RESP}"; exit 1;;
+            esac
             sleep 30
           done
 
           DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          if [ -z "${DATASET_ID}" ]; then
-            echo "No dataset id found."
-            printf "%s\n" "${RESP}" | sed -n '1,200p'
-            exit 1
-          fi
+          [ -n "${DATASET_ID}" ] || { echo "No dataset id"; echo "${RESP}"; exit 1; }
 
           curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
-          if [ ! -s "${OUT_RAW}" ]; then
-            echo "Downloaded CSV is empty."
-            exit 1
-          fi
+          [ -s "${OUT_RAW}" ] || { echo "Empty CSV"; exit 1; }
+          echo "Raw CSV preview:"; head -5 "${OUT_RAW}"
 
-          echo "Raw CSV preview:"
-          head -5 "${OUT_RAW}"
-
-      # 2) Normalize (hardened) – unchanged from your last working version
+      # 2) Normalize (robust shortCode + timestamp discovery)
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -125,41 +109,43 @@ jobs:
                           dt=pd.to_datetime(num,unit=unit,errors="coerce",utc=True)
                           if pd.notna(dt): return dt
               return pd.NaT
-          df["_sc"]=df[sc_col] if sc_col else ""
-          df["_sc"]=df["_sc"].astype(str).str.strip()
-          df["_postUrl"]=df[posturl_col] if posturl_col else ""
-          dt_series=df.apply(parse_ts_row,axis=1)
-          df["_dt"]=dt_series
+          df["_sc"]= (df[sc_col] if sc_col else "").astype(str).str.strip()
+          df["_postUrl"]= df[posturl_col] if posturl_col else ""
+          df["_dt"]= df.apply(parse_ts_row,axis=1)
           parent=df.loc[(df["_sc"].ne("")) & (df["_dt"].notna())].copy()
           if parent.empty:
               print("No parent rows with shortCode + timestamp found. Raw columns:", list(df.columns))
               pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst,index=False)
               raise SystemExit(0)
           parent["date_v4"]=parent["_dt"].dt.strftime("%Y-%m-%d")
-          type_col=col("type","productType","media_type"); cap_col=col("caption","caption_v4","caption_v3")
-          like_col=col("likesCount","likes","like_count","edge_media_preview_like.count")
-          com_col=col("commentsCount","comments","comment_count")
-          vvc_col=col("videoViewCount","video_views","playCount","videoPlayCount")
-          disp_col=col("displayUrl","imageUrl","thumbnailUrl","display_url")
-          vid_col=col("videoUrl","video_url")
           def first_nonempty(s):
               for v in s:
                   sv=str(v) if pd.notna(v) else ""
                   if sv.strip(): return sv
               return ""
+          def colopt(*names): 
+              c=col(*names)
+              return c if c in parent.columns else None
+          type_col=colopt("type","productType","media_type")
+          cap_col =colopt("caption","caption_v4","caption_v3")
+          like_col=colopt("likesCount","likes","like_count","edge_media_preview_like.count")
+          com_col =colopt("commentsCount","comments","comment_count")
+          vvc_col =colopt("videoViewCount","video_views","playCount","videoPlayCount")
+          disp_col=colopt("displayUrl","imageUrl","thumbnailUrl","display_url")
+          vid_col =colopt("videoUrl","video_url")
           rows=[]
           for sc,grp in parent.groupby("_sc"):
               row={"shortCode":sc,
                    "postUrl":first_nonempty(grp["_postUrl"]),
-                   "caption":first_nonempty(grp[cap_col]) if cap_col in grp.columns else "",
-                   "type":first_nonempty(grp[type_col]) if type_col in grp.columns else "",
-                   "likesCount":first_nonempty(grp[like_col]) if like_col in grp.columns else "",
-                   "commentsCount":first_nonempty(grp[com_col]) if com_col in grp.columns else "",
-                   "displayUrl":first_nonempty(grp[disp_col]) if disp_col in grp.columns else "",
-                   "videoUrl":first_nonempty(grp[vid_col]) if vid_col in grp.columns else "",
+                   "caption":first_nonempty(grp[cap_col]) if cap_col else "",
+                   "type":first_nonempty(grp[type_col]) if type_col else "",
+                   "likesCount":first_nonempty(grp[like_col]) if like_col else "",
+                   "commentsCount":first_nonempty(grp[com_col]) if com_col else "",
+                   "displayUrl":first_nonempty(grp[disp_col]) if disp_col else "",
+                   "videoUrl":first_nonempty(grp[vid_col]) if vid_col else "",
                    "date_v4":first_nonempty(grp["date_v4"]),
                    "__dt":grp["_dt"].max()}
-              if vvc_col and vvc_col in grp.columns:
+              if vvc_col:
                   try:
                       vv=pd.to_numeric(grp[vvc_col].replace("",np.nan),errors="coerce").max()
                       row["views"]= "" if pd.isna(vv) else str(int(vv))
@@ -178,7 +164,7 @@ jobs:
           print(clean.head(10).to_string(index=False))
           PY
 
-      # 3) Media manifest – unchanged
+      # 3) Media manifest (no downloads yet)
       - name: Create media manifest (no downloads yet)
         run: |
           python - <<'PY'
@@ -201,7 +187,20 @@ jobs:
           pd.DataFrame(out).to_csv("pipeline/media_manifest.csv",index=False)
           PY
 
-      # 4) Download IG videos (yt-dlp) and extract 10 frames each – IMPROVED
+      # 4) Write Instagram cookies for yt-dlp (if provided)
+      - name: Prepare IG cookies (optional)
+        env:
+          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IG_SESSIONID:-}" ]; then
+            echo -e "# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSIONID}" > cookies.txt
+            echo "Cookies written to cookies.txt"
+          else
+            echo "No IG_SESSIONID secret set — proceeding without cookies (downloads may fail)."
+          fi
+
+      # 5) Download up to 10 IG videos with yt-dlp + extract 10 frames each; keep only MP4s
       - name: Download IG videos (yt-dlp) and extract 10 frames each
         run: |
           set -euo pipefail
@@ -213,7 +212,7 @@ jobs:
 
           df = pd.read_csv("pipeline/latest_posts.csv")
 
-          # PRIORITISE likely-video rows: presence of videoUrl or type hints; else fall back to all postUrl
+          # Prioritise likely-video rows (videoUrl present, type says video/reel, or URL path contains /reel/)
           candidates = []
           for _, r in df.iterrows():
             u = str(r.get("postUrl") or "").strip()
@@ -221,23 +220,30 @@ jobs:
             t  = str(r.get("type") or "").lower()
             score = 0
             if vu.startswith("http"): score += 2
-            if "video" in t or "reel" in u: score += 1
+            if "/reel/" in u or "video" in t: score += 1
             if u.startswith("http"):
               candidates.append((score, u))
-          # highest score first; scan deeper (first 100)
-          urls = [u for _,u in sorted(candidates, key=lambda x: x[0], reverse=True)][:100]
-          # dedupe preserving order
-          seen=set(); urls=[u for u in urls if not (u in seen or seen.add(u))]
+          candidates.sort(key=lambda x: x[0], reverse=True)
+          urls = []
+          seen=set()
+          for score, u in candidates:
+            if u not in seen:
+              urls.append(u); seen.add(u)
+            if len(urls) >= 120:  # scan deeper to increase hit rate
+              break
 
+          print(f"Scanning {len(urls)} candidate post URLs for video…")
           downloaded = []
+
           def try_download(u, tries=2, sleep_s=2):
+            base = "yt-dlp --no-playlist -S ext:mp4:m4a --merge-output-format mp4 --no-keep-video --no-keep-fragments --no-warnings -o 'media_video/%(id)s.%(ext)s' "
+            if os.path.exists('cookies.txt'):
+              base += "--cookies cookies.txt "
+            cmd = base + shlex.quote(u)
             for k in range(tries):
-              print(f"[yt-dlp attempt {k+1}/{tries}] {u}")
-              # select best mp4, merge to mp4, do not keep fragments/originals
-              cmd = f"yt-dlp --no-playlist -S ext:mp4:m4a --merge-output-format mp4 --no-keep-video --no-keep-fragments --no-warnings -o 'media_video/%(id)s.%(ext)s' {shlex.quote(u)}"
+              print(f"[yt-dlp {k+1}/{tries}] {u}")
               rc = subprocess.run(cmd, shell=True).returncode
               if rc == 0:
-                # pick newest mp4
                 mp4s = sorted([f for f in os.listdir('media_video') if f.endswith('.mp4')],
                               key=lambda x: os.path.getmtime(os.path.join('media_video',x)), reverse=True)
                 if mp4s:
@@ -246,18 +252,17 @@ jobs:
             return None
 
           for u in urls:
-            if len(downloaded) >= 5: break
+            if len(downloaded) >= 10: break
             path = try_download(u)
             if path:
               downloaded.append(path)
               print("Downloaded:", path)
 
-          # Clean up any stray audio/parts to save space
-          for f in os.listdir('media_video'):
+          # Remove non-mp4 leftovers to save space
+          for f in list(os.listdir('media_video')):
             if not f.endswith('.mp4'):
-              try:
-                os.remove(os.path.join('media_video', f))
-              except Exception: pass
+              try: os.remove(os.path.join('media_video', f))
+              except: pass
 
           if not downloaded:
             print("No videos downloaded; skipping frame extraction.")
@@ -265,7 +270,9 @@ jobs:
 
           def ffprobe_duration(path):
             try:
-              out = subprocess.check_output(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]).decode().strip()
+              out = subprocess.check_output(
+                ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
+              ).decode().strip()
               return float(out) if out else None
             except Exception:
               return None
@@ -275,15 +282,17 @@ jobs:
             dur = ffprobe_duration(vid)
             if not dur or dur <= 0:
               print("Could not probe duration for", vid); continue
-            stamps = [(i+1)*dur/11 for i in range(10)]  # 10 evenly spaced points
+            stamps = [(i+1)*dur/11 for i in range(10)]  # 10 evenly spaced frames
             for idx,t in enumerate(stamps,1):
               out = f"frames_video/{base}_frame_{idx:02d}.jpg"
-              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run(
+                ["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+              )
               print("Saved frame:", out)
           PY
 
-      # 5) Upload artifacts
+      # 6) Upload artifacts (CSVs, manifest, videos, frames)
       - name: Upload artifacts (csvs, manifest, videos, frames)
         uses: actions/upload-artifact@v4
         with:
@@ -295,7 +304,7 @@ jobs:
             media_video
             frames_video
 
-      # 6) (Optional) Baseline to Notion
+      # 7) (Optional) Baseline to Notion
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
