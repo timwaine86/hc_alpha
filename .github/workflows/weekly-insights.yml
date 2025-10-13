@@ -43,7 +43,8 @@ jobs:
           OUT_RAW="pipeline/latest_posts_raw.csv"
           RUN_JSON="pipeline/apify_run.json"
 
-          JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":30,"proxy":{"useApifyProxy":true}}'
+          # Grab more, then we'll filter to last 7d locally to avoid schema issues
+          JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":100,"proxy":{"useApifyProxy":true}}'
 
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
@@ -74,18 +75,22 @@ jobs:
           [ -s "${OUT_RAW}" ] || { echo "Empty CSV"; exit 1; }
           echo "Raw CSV preview:"; head -5 "${OUT_RAW}"
 
-      # 2) Normalize (robust shortCode + timestamp discovery)
+      # 2) Normalize: robust shortCode + timestamp; KEEP ONLY LAST 7 DAYS; dedupe; tidy columns
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
           import pandas as pd, numpy as np, re
+          from pandas import Timestamp, Timedelta
+
           src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
           df=pd.read_csv(src,dtype=str,keep_default_na=False)
+
           lower={c.lower():c for c in df.columns}
           def col(*names):
               for n in names:
                   if n and n.lower() in lower: return lower[n.lower()]
               return None
+
           sc_col=col("shortCode","short_code","shortcode")
           posturl_col=col("postUrl","url","permalink","link")
           if not sc_col and posturl_col:
@@ -94,9 +99,11 @@ jobs:
                   return m.group(1) if m else ""
               df["__shortCode_from_url"]=df[posturl_col].map(extract_sc)
               sc_col="__shortCode_from_url"
+
           ts_candidates=["timestamp","takenAt","taken_at","takenAtISO","taken_at_iso","takenAtUtc","taken_at_utc",
                          "takenAtTimestamp","taken_at_timestamp","created_time","createdAt","published_time","date","time","datetime"]
           ts_cols=[c for c in (col(x) for x in ts_candidates) if c]
+
           def parse_ts_row(row):
               for c in ts_cols:
                   val=str(row.get(c,"")).strip()
@@ -109,23 +116,34 @@ jobs:
                           dt=pd.to_datetime(num,unit=unit,errors="coerce",utc=True)
                           if pd.notna(dt): return dt
               return pd.NaT
+
           df["_sc"]= (df[sc_col] if sc_col else "").astype(str).str.strip()
           df["_postUrl"]= df[posturl_col] if posturl_col else ""
           df["_dt"]= df.apply(parse_ts_row,axis=1)
-          parent=df.loc[(df["_sc"].ne("")) & (df["_dt"].notna())].copy()
+
+          # ----- weekly filter -----
+          now = Timestamp.now(tz="UTC")
+          week_cut = now - Timedelta(days=7)
+          df = df.loc[df["_dt"].notna() & (df["_dt"] >= week_cut)].copy()
+
+          parent=df.loc[(df["_sc"].ne(""))].copy()
           if parent.empty:
-              print("No parent rows with shortCode + timestamp found. Raw columns:", list(df.columns))
+              print("No weekly rows with shortCode found. Columns:", list(df.columns))
               pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst,index=False)
               raise SystemExit(0)
+
           parent["date_v4"]=parent["_dt"].dt.strftime("%Y-%m-%d")
+
           def first_nonempty(s):
               for v in s:
                   sv=str(v) if pd.notna(v) else ""
                   if sv.strip(): return sv
               return ""
-          def colopt(*names): 
+
+          def colopt(*names):
               c=col(*names)
-              return c if c in parent.columns else None
+              return c if (c in parent.columns) else None
+
           type_col=colopt("type","productType","media_type")
           cap_col =colopt("caption","caption_v4","caption_v3")
           like_col=colopt("likesCount","likes","like_count","edge_media_preview_like.count")
@@ -133,6 +151,7 @@ jobs:
           vvc_col =colopt("videoViewCount","video_views","playCount","videoPlayCount")
           disp_col=colopt("displayUrl","imageUrl","thumbnailUrl","display_url")
           vid_col =colopt("videoUrl","video_url")
+
           rows=[]
           for sc,grp in parent.groupby("_sc"):
               row={"shortCode":sc,
@@ -152,42 +171,24 @@ jobs:
                   except: row["views"]=first_nonempty(grp[vvc_col])
               else: row["views"]=""
               rows.append(row)
+
           clean=pd.DataFrame(rows)
           clean["__dt"]=pd.to_datetime(clean["__dt"],errors="coerce",utc=True)
-          clean=clean.sort_values("__dt",ascending=False).head(30).reset_index(drop=True)
-          final_cols=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]
+          clean=clean.sort_values("__dt",ascending=False).reset_index(drop=True)
+
+          final_cols=["date_v4","shortCode","postUrl","type","caption",
+                      "likesCount","commentsCount","views","displayUrl","videoUrl"]
           for c in final_cols:
               if c not in clean.columns: clean[c]=""
           clean=clean[final_cols]
           clean.to_csv(dst,index=False)
-          print("Normalized columns:", list(clean.columns))
+
+          print("Kept rows (last 7 days):", len(clean))
+          print("Columns:", list(clean.columns))
           print(clean.head(10).to_string(index=False))
           PY
 
-      # 3) Media manifest (no downloads yet)
-      - name: Create media manifest (no downloads yet)
-        run: |
-          python - <<'PY'
-          import pandas as pd, re
-          raw=pd.read_csv("pipeline/latest_posts_raw.csv")
-          clean=pd.read_csv("pipeline/latest_posts.csv")
-          def find(cols,pat): return [c for c in cols if re.search(pat,c,re.I)]
-          url_cols=find(raw.columns,r'(display|image|thumb|media|video).*url$|^url$')
-          type_cols=find(raw.columns,r'(is|media).*video|product.*type|type$')
-          id_cols=find(raw.columns,r'shortcode$|^short[_]?code$|postid$|id$')
-          id_col=id_cols[0] if id_cols else None
-          media_type=None
-          if type_cols:
-              t=raw[type_cols[0]].astype(str).str.lower()
-              media_type=t.map(lambda x:'video' if ('true' in x or 'video' in x) else 'image')
-          out={'post_id':raw[id_col] if id_col else pd.Series(range(len(raw))),
-               'media_type': media_type if media_type is not None else pd.Series(['unknown']*len(raw))}
-          for c in url_cols: out[c]=raw[c]
-          out['shortCode']=clean.get('shortCode')
-          pd.DataFrame(out).to_csv("pipeline/media_manifest.csv",index=False)
-          PY
-
-      # 4) Download videos: try direct videoUrl first; if not enough, fall back to yt-dlp with headers/cookies; extract 10 frames each
+      # 3) Download videos (direct videoUrl first, then yt-dlp with cookies) -> save as <shortCode>.mp4; extract frames to frames_video/<shortCode>/
       - name: Download IG videos and extract 10 frames each
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
@@ -205,106 +206,83 @@ jobs:
 
           df = pd.read_csv("pipeline/latest_posts.csv")
 
-          # ---- 1) Try direct CDN download from videoUrl (fastest, no cookie) ----
-          direct = []
-          s = requests.Session()
-          headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36",
-                     "Referer": "https://www.instagram.com/"}
+          # Build cookie header if provided
+          cookie_names = [("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
+                          ("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]
+          parts=[]
+          for name,envk in cookie_names:
+            val=os.environ.get(envk,"").strip()
+            if val: parts.append(f"{name}={val}")
+          COOKIE="; ".join(parts)
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
+          REF="https://www.instagram.com/"
 
-          for _, r in df.iterrows():
-            vu = str(r.get("videoUrl") or "").strip()
-            sc = str(r.get("shortCode") or "").strip()
-            if not vu or not sc:
+          s = requests.Session()
+          s.headers.update({"User-Agent":UA,"Referer":REF})
+          if COOKIE:
+            s.headers.update({"Cookie":COOKIE})
+
+          downloaded=[]
+
+          # 1) direct download from videoUrl when present
+          for _,r in df.iterrows():
+            sc=str(r.get("shortCode") or "").strip()
+            vu=str(r.get("videoUrl") or "").strip()
+            if not sc or not vu: continue
+            out=f"media_video/{sc}.mp4"
+            if os.path.exists(out): 
+              downloaded.append(out); 
               continue
             try:
-              with s.get(vu, headers=headers, stream=True, timeout=45) as resp:
-                ct = (resp.headers.get("Content-Type") or "").lower()
-                if resp.status_code == 200 and "video/mp4" in ct:
-                  out = f"media_video/{sc}.mp4"
-                  with open(out, "wb") as f:
+              with s.get(vu, stream=True, timeout=45) as resp:
+                ct=(resp.headers.get("Content-Type") or "").lower()
+                if resp.status_code==200 and "video/mp4" in ct:
+                  with open(out,"wb") as f:
                     for chunk in resp.iter_content(8192):
                       if chunk: f.write(chunk)
                   print("Direct saved:", out)
-                  direct.append(out)
+                  downloaded.append(out)
             except Exception as e:
-              print("Direct download failed for", sc, e)
-            if len(direct) >= 10:
-              break
+              print("Direct failed for", sc, e)
 
-          # ---- 2) If fewer than 10, try yt-dlp with Cookie+UA+Referer on postUrl ----
-          target = 10
-          downloaded = list(direct)
-
-          # Build Cookie header from whatever we have
-          import os
-          cookie_parts = []
-          for name, envkey in [("sessionid","IG_SESSIONID"),
-                               ("ds_user_id","IG_DS_USER_ID"),
-                               ("csrftoken","IG_CSRF"),
-                               ("rur","IG_RUR"),
-                               ("mid","IG_MID")]:
-            val = os.environ.get(envkey,"").strip()
-            if val:
-              cookie_parts.append(f"{name}={val}")
-          cookie_hdr = "; ".join(cookie_parts)
-
-          ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
-          add_headers = []
-          add_headers += ["--add-header", f"User-Agent:{ua}"]
-          add_headers += ["--add-header", "Referer:https://www.instagram.com/"]
-          if cookie_hdr:
-            add_headers += ["--add-header", f"Cookie:{cookie_hdr}"]
-
-          # Prioritise likely videos (reel/video)
-          candidates = []
-          seen = set()
-          for _, r in df.iterrows():
-            u = str(r.get("postUrl") or "").strip()
-            if not u or u in seen:
-              continue
-            score = 0
-            if "/reel/" in u: score += 2
-            score += 1  # at least try it
-            candidates.append((score, u))
-            seen.add(u)
-          candidates.sort(key=lambda x: x[0], reverse=True)
-          urls = [u for _,u in candidates][:120]  # scan deeper
-
-          def try_ytdlp(u, tries=2, sleep_s=2):
-            base = ["yt-dlp", "--no-playlist", "-S", "ext:mp4:m4a", "--merge-output-format", "mp4",
-                    "--no-keep-video", "--no-keep-fragments", "--no-warnings",
-                    "-o", "media_video/%(id)s.%(ext)s"]
-            cmd = base + add_headers + [u]
+          # 2) yt-dlp on postUrl (cookie/headers) for anything not yet downloaded
+          def ytdlp_for(sc, url, tries=2, sleep_s=2):
+            base = ["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
+                    "--no-keep-video","--no-keep-fragments","--no-warnings",
+                    "-o", f"media_video/{sc}.%(ext)s",
+                    "--add-header", f"User-Agent:{UA}",
+                    "--add-header", f"Referer:{REF}"]
+            if COOKIE:
+              base += ["--add-header", f"Cookie:{COOKIE}"]
+            cmd = base + [url]
             for k in range(tries):
-              print(f"[yt-dlp {k+1}/{tries}] {u}")
+              print(f"[yt-dlp {k+1}/{tries}] {url}")
               rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-              if rc == 0:
-                mp4s = sorted([f for f in os.listdir('media_video') if f.endswith('.mp4')],
-                              key=lambda x: os.path.getmtime(os.path.join('media_video',x)), reverse=True)
-                if mp4s:
-                  return os.path.join('media_video', mp4s[0])
+              if rc==0 and os.path.exists(f"media_video/{sc}.mp4"):
+                return True
               time.sleep(sleep_s)
-            return None
+            return False
 
-          for u in urls:
-            if len(downloaded) >= target:
-              break
-            path = try_ytdlp(u)
-            if path and path not in downloaded:
-              downloaded.append(path)
-              print("yt-dlp saved:", path)
+          for _,r in df.iterrows():
+            sc=str(r.get("shortCode") or "").strip()
+            url=str(r.get("postUrl") or "").strip()
+            if not sc or not url: continue
+            if os.path.exists(f"media_video/{sc}.mp4"): continue
+            ok = ytdlp_for(sc,url)
+            if ok:
+              downloaded.append(f"media_video/{sc}.mp4")
 
-          # Clean up non-mp4 left-overs
-          for f in list(os.listdir('media_video')):
-            if not f.endswith('.mp4'):
-              try: os.remove(os.path.join('media_video', f))
+          # remove any non-mp4 leftovers
+          for f in list(os.listdir("media_video")):
+            if not f.endswith(".mp4"):
+              try: os.remove(os.path.join("media_video",f))
               except: pass
 
           if not downloaded:
             print("No videos saved; skipping frames.")
             raise SystemExit(0)
 
-          # ---- 3) Extract 10 evenly spaced frames per video ----
+          # Extract frames into per-shortCode folders
           def ffprobe_duration(path):
             try:
               out = subprocess.check_output(
@@ -315,33 +293,32 @@ jobs:
               return None
 
           for vid in downloaded:
-            base = os.path.splitext(os.path.basename(vid))[0]
-            dur = ffprobe_duration(vid)
-            if not dur or dur <= 0:
+            sc=os.path.splitext(os.path.basename(vid))[0]
+            dur=ffprobe_duration(vid)
+            if not dur or dur<=0:
               print("Could not probe duration for", vid); continue
-            stamps = [(i+1)*dur/11 for i in range(10)]
+            target_dir=os.path.join("frames_video", sc)
+            os.makedirs(target_dir, exist_ok=True)
+            stamps=[(i+1)*dur/11 for i in range(10)]
             for idx,t in enumerate(stamps,1):
-              out = f"frames_video/{base}_frame_{idx:02d}.jpg"
-              subprocess.run(
-                ["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-              )
+              out=os.path.join(target_dir, f"frame_{idx:02d}.jpg")
+              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               print("Saved frame:", out)
           PY
 
-      # 5) Upload artifacts (CSVs, manifest, videos, frames)
-      - name: Upload artifacts (csvs, manifest, videos, frames)
+      # 4) Upload artifacts (CSVs, videos, frames)
+      - name: Upload artifacts (csvs, videos, frames)
         uses: actions/upload-artifact@v4
         with:
-          name: apify_csvs_media_and_frames
+          name: weekly_csvs_videos_frames
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
-            pipeline/media_manifest.csv
             media_video
             frames_video
 
-      # 6) (Optional) Baseline to Notion
+      # 5) (Optional) Baseline to Notion
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
