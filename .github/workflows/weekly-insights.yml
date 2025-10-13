@@ -148,7 +148,7 @@ jobs:
           cap_col =colopt("caption","caption_v4","caption_v3")
           like_col=colopt("likesCount","likes","like_count","edge_media_preview_like.count")
           com_col =colopt("commentsCount","comments","comment_count")
-          vvc_col =colopt("videoViewCount","video_views","playCount","videoPlayCount")
+          vvc_col =colopt("videoViewCount","video_views","PlayCount","videoPlayCount")
           disp_col=colopt("displayUrl","imageUrl","thumbnailUrl","display_url")
           vid_col =colopt("videoUrl","video_url")
 
@@ -188,7 +188,7 @@ jobs:
           print(clean.head(10).to_string(index=False))
           PY
 
-      # 3) Download videos (direct videoUrl first, then yt-dlp with cookies) -> save as <shortCode>.mp4; extract frames to frames_video/<shortCode>/
+      # 3) Download videos -> <shortCode>.mp4; extract frames to frames_video/<shortCode>/
       - name: Download IG videos and extract 10 frames each
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
@@ -307,18 +307,182 @@ jobs:
               print("Saved frame:", out)
           PY
 
-      # 4) Upload artifacts (CSVs, videos, frames)
-      - name: Upload artifacts (csvs, videos, frames)
+      # 4) Classify visual motifs (OpenAI Vision) -> pipeline/motif_results.csv
+      - name: Classify visual motifs (OpenAI Vision)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, base64, glob, pandas as pd
+          from datetime import datetime
+          from tenacity import retry, stop_after_attempt, wait_exponential
+          from openai import OpenAI
+
+          client = OpenAI()
+
+          MOTIF_LABELS = [
+            "Product Macro",
+            "Lifestyle / Environment",
+            "Crowd POV",
+            "Creator POV"
+          ]
+
+          SYSTEM = """You classify social video frames into ONE visual motif:
+          1) Product Macro — close-up bottle/product, clean framing.
+          2) Lifestyle / Environment — product in everyday context (desk, commute, bag), routine scenes.
+          3) Crowd POV — crowds, event/stadium energy, spectacle.
+          4) Creator POV — handheld/first-person or creator interview/training/prep.
+
+          Rules:
+          - Return ONLY a JSON object: {"motif": <label>, "confidence": 0-1, "reason": "<12 words>"}.
+          - Consider all provided frames together; pick a single best label.
+          """
+
+          def enc_img(path):
+            with open(path, "rb") as f:
+              b64 = base64.b64encode(f.read()).decode("utf-8")
+            return {"type":"input_image", "image_url":{"url": f"data:image/jpeg;base64,{b64}"}}
+
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
+          def classify_frames(sc, frame_paths):
+            content = [{"type":"input_text","text":SYSTEM}]
+            # add up to 3 frames: first, middle, last
+            picks = []
+            if frame_paths:
+              picks = [frame_paths[0], frame_paths[len(frame_paths)//2], frame_paths[-1]]
+            for p in picks:
+              content.append(enc_img(p))
+            # fallback: if somehow no frames, still call with text
+            resp = client.chat.completions.create(
+              model="gpt-4o-mini",
+              messages=[{"role":"user","content":content}],
+              temperature=0
+            )
+            return resp.choices[0].message.content.strip()
+
+          # walk frames folders
+          rows=[]
+          for sc_dir in sorted(glob.glob("frames_video/*")):
+            if not os.path.isdir(sc_dir): continue
+            sc = os.path.basename(sc_dir)
+            frames = sorted(glob.glob(os.path.join(sc_dir,"frame_*.jpg")))
+            if not frames: continue
+            try:
+              result = classify_frames(sc, frames)
+            except Exception as e:
+              result = '{"motif":"Lifestyle / Environment","confidence":0.5,"reason":"fallback"}'
+              print("⚠️ classify error for", sc, e)
+
+            rows.append({"shortCode": sc, "result": result})
+
+          out = "pipeline/motif_results.csv"
+          pd.DataFrame(rows).to_csv(out, index=False)
+          print("Wrote:", out, "rows:", len(rows))
+          PY
+
+      # 5) Publish weekly visual narrative to Notion (one card, per-post list)
+        # Creates "Weekly Motifs" entry: headline + summary + per-post bullets
+      - name: Publish weekly visual narrative to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, json, re, pandas as pd, requests
+          from datetime import datetime, timezone
+
+          NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+          DB_ID = os.environ["NOTION_DB_MASPLUS"]
+          H = {
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+          }
+
+          def rt(x): return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
+          def ttl(x): return {"title":[{"type":"text","text":{"content":str(x)[:200]}}]}
+          def sel(x): return {"select":{"name":x}}
+
+          posts = pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
+          motifs = pd.read_csv("pipeline/motif_results.csv") if os.path.exists("pipeline/motif_results.csv") else pd.DataFrame(columns=["shortCode","result"])
+
+          # parse model JSON strings
+          def parse_json(s):
+            try:
+              j = json.loads(s)
+              if isinstance(j,str): j=json.loads(j)
+              return j
+            except Exception:
+              # best-effort extract motif label
+              m = re.search(r'"motif"\s*:\s*"([^"]+)"', str(s))
+              return {"motif": m.group(1) if m else "Lifestyle / Environment", "confidence": 0.5, "reason":"parsed"}
+          motifs_parsed = []
+          for _,r in motifs.iterrows():
+            obj = parse_json(r["result"])
+            motifs_parsed.append({"shortCode": r["shortCode"], "motif": obj.get("motif","Lifestyle / Environment"),
+                                  "confidence": obj.get("confidence", 0.5), "reason": obj.get("reason","")})
+          motifs_df = pd.DataFrame(motifs_parsed)
+
+          week = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          merged = posts.merge(motifs_df, on="shortCode", how="left")
+
+          # quick caption intent (text-only, light heuristic here to keep things simple for now)
+          def intent_from_caption(c):
+            c = str(c or "").lower()
+            if any(k in c for k in ["vote","which","choose","rate","drop","comment"]): return "Participation / Prompt"
+            if any(k in c for k in ["ready","locked in","focus","hydrated","routine"]): return "Focus / Discipline"
+            if any(k in c for k in ["available","launch","now in","shop","link","price"]): return "Product / Availability"
+            return "Celebration / Moment"
+          merged["intent"] = merged["caption"].map(intent_from_caption)
+
+          # headline & summary
+          motif_counts = merged["motif"].value_counts(dropna=False).to_dict()
+          motif_line = " • ".join([f"{k}: {v}" for k,v in motif_counts.items()])
+          headline = f"Weekly Visual Motifs — {week}"
+          summary  = f"Posts: {len(merged)} | Motifs: {motif_line}"
+
+          # build per-post bullets
+          bullets=[]
+          for _,r in merged.iterrows():
+            bullets.append(f"- {r.get('date_v4','?')} | {r.get('shortCode','')} | Motif: {r.get('motif','?')} | Intent: {r.get('intent','?')} | {r.get('postUrl','')}")
+
+          body = summary + "\n" + "\n".join(bullets)
+
+          payload = {
+            "parent": {"database_id": DB_ID},
+            "properties": {
+              "Date": {"date": {"start": week}},
+              "Insight Type": sel("Weekly Motifs"),
+              "Headline": rt(headline),
+              "Status": sel("Published"),
+              "Title": ttl("Weekly Motifs"),
+            },
+            "children": [
+              {"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":body[:1900]}}]}},
+            ],
+          }
+          r = requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
+          if r.status_code >= 300:
+            print("❌ Notion create error:", r.status_code, r.text)
+          else:
+            print("✅ Notion page created.")
+          PY
+
+      # 6) Upload artifacts (CSVs, videos, frames, motif results)
+      - name: Upload artifacts (csvs, videos, frames, motifs)
         uses: actions/upload-artifact@v4
         with:
-          name: weekly_csvs_videos_frames
+          name: weekly_csvs_videos_frames_and_motifs
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
             media_video
             frames_video
+            pipeline/motif_results.csv
 
-      # 5) (Optional) Baseline to Notion
+      # 7) (Optional) Baseline to Notion (your existing weekly pulse)
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
