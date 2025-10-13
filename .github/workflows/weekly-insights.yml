@@ -51,12 +51,7 @@ jobs:
             -d "${JSON_PAYLOAD}" \
             -o "${RUN_JSON}"
 
-          RUN_ID=$(python - <<'PY'
-          import json,sys
-          d=json.load(open(sys.argv[1]))
-          print(d.get("data",{}).get("id",""))
-          PY
-          "${RUN_JSON}")
+          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
           if [ -z "${RUN_ID}" ]; then
             echo "Failed to start Apify run"
             sed -n '1,200p' "${RUN_JSON}" || true
@@ -65,29 +60,19 @@ jobs:
 
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
-            STATUS=$(printf "%s" "${RESP}" | python - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("data",{}).get("status",""))
-PY
-)
+            STATUS=$(printf '%s' "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("data",{}).get("status",""))')
             echo "status: ${STATUS}"
             case "${STATUS}" in
               SUCCEEDED) break;;
-              FAILED|TIMED-OUT|ABORTED) echo "${RESP}"; exit 1;;
+              FAILED|TIMED-OUT|ABORTED) printf '%s\n' "${RESP}"; exit 1;;
             esac
             sleep 30
           done
 
-          DATASET_ID=$(printf "%s" "${RESP}" | python - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("data",{}).get("defaultDatasetId",""))
-PY
-)
+          DATASET_ID=$(printf '%s' "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("data",{}).get("defaultDatasetId",""))')
           if [ -z "${DATASET_ID}" ]; then
             echo "No dataset id"
-            echo "${RESP}"
+            printf '%s\n' "${RESP}"
             exit 1
           fi
 
