@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -33,7 +33,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      # 1) Fetch from Apify (grab up to 100, we filter locally to last 7d)
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -52,12 +51,26 @@ jobs:
             -d "${JSON_PAYLOAD}" \
             -o "${RUN_JSON}"
 
-          RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          [ -n "${RUN_ID}" ] || { echo "Failed to start Apify run"; sed -n '1,200p' "${RUN_JSON}"; exit 1; }
+          RUN_ID=$(python - <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          print(d.get("data",{}).get("id",""))
+          PY
+          "${RUN_JSON}")
+          if [ -z "${RUN_ID}" ]; then
+            echo "Failed to start Apify run"
+            sed -n '1,200p' "${RUN_JSON}" || true
+            exit 1
+          fi
 
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
-            STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
+            STATUS=$(printf "%s" "${RESP}" | python - <<'PY'
+import json,sys
+d=json.loads(sys.stdin.read() or "{}")
+print(d.get("data",{}).get("status",""))
+PY
+)
             echo "status: ${STATUS}"
             case "${STATUS}" in
               SUCCEEDED) break;;
@@ -66,14 +79,25 @@ jobs:
             sleep 30
           done
 
-          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          [ -n "${DATASET_ID}" ] || { echo "No dataset id"; echo "${RESP}"; exit 1; }
+          DATASET_ID=$(printf "%s" "${RESP}" | python - <<'PY'
+import json,sys
+d=json.loads(sys.stdin.read() or "{}")
+print(d.get("data",{}).get("defaultDatasetId",""))
+PY
+)
+          if [ -z "${DATASET_ID}" ]; then
+            echo "No dataset id"
+            echo "${RESP}"
+            exit 1
+          fi
 
           curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
-          [ -s "${OUT_RAW}" ] || { echo "Empty CSV"; exit 1; }
+          if [ ! -s "${OUT_RAW}" ]; then
+            echo "Empty CSV"
+            exit 1
+          fi
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize -> last 7 days, robust shortCode + timestamp, tidy columns
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -82,11 +106,13 @@ jobs:
 
           src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
           df=pd.read_csv(src,dtype=str,keep_default_na=False)
+
           lower={c.lower():c for c in df.columns}
-          def col(*names): 
+          def col(*names):
               for n in names:
                   if n and n.lower() in lower: return lower[n.lower()]
               return None
+
           sc_col=col("shortCode","short_code","shortcode")
           posturl_col=col("postUrl","url","permalink","link")
           if not sc_col and posturl_col:
@@ -115,7 +141,6 @@ jobs:
           df["_postUrl"]= df[posturl_col] if posturl_col else ""
           df["_dt"]= df.apply(parse_ts_row,axis=1)
 
-          # weekly filter
           now = Timestamp.now(tz="UTC"); week_cut = now - Timedelta(days=7)
           df = df.loc[df["_dt"].notna() & (df["_dt"] >= week_cut)].copy()
 
@@ -125,6 +150,7 @@ jobs:
               raise SystemExit(0)
 
           parent["date_v4"]=parent["_dt"].dt.strftime("%Y-%m-%d")
+
           def first_nonempty(s):
               for v in s:
                   sv=str(v) if pd.notna(v) else ""
@@ -133,6 +159,7 @@ jobs:
 
           def colopt(*names):
               c=col(*names); return c if (c in parent.columns) else None
+
           type_col=colopt("type","productType","media_type")
           cap_col =colopt("caption","caption_v4","caption_v3")
           like_col=colopt("likesCount","likes","like_count","edge_media_preview_like.count")
@@ -165,8 +192,7 @@ jobs:
           clean["__dt"]=pd.to_datetime(clean["__dt"],errors="coerce",utc=True)
           clean=clean.sort_values("__dt",ascending=False).reset_index(drop=True)
 
-          final_cols=["date_v4","shortCode","postUrl","type","caption",
-                      "likesCount","commentsCount","views","displayUrl","videoUrl"]
+          final_cols=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]
           for c in final_cols:
               if c not in clean.columns: clean[c]=""
           clean=clean[final_cols]
@@ -174,7 +200,6 @@ jobs:
           print("Weekly rows:", len(clean))
           PY
 
-      # 3) Videos -> <shortCode>.mp4 ; frames -> frames_video/<shortCode>/frame_XX.jpg
       - name: Download IG videos and extract 10 frames each
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
@@ -192,7 +217,6 @@ jobs:
 
           df=pd.read_csv("pipeline/latest_posts.csv")
 
-          # cookie header
           cookie_names=[("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
                         ("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]
           parts=[]
@@ -210,7 +234,6 @@ jobs:
 
           downloaded=[]
 
-          # direct CDN first
           for _,r in df.iterrows():
             sc=str(r["shortCode"]); vu=str(r.get("videoUrl","") or "")
             if not sc or not vu: continue
@@ -227,7 +250,6 @@ jobs:
             except Exception as e:
               print("Direct failed for", sc, e)
 
-          # yt-dlp fallback for any remaining
           def ytdlp(sc,url):
             base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
                   "--no-keep-video","--no-keep-fragments","--no-warnings",
@@ -247,7 +269,6 @@ jobs:
                 downloaded.append(f"media_video/{sc}.mp4"); break
               time.sleep(2)
 
-          # delete leftovers
           for f in list(os.listdir("media_video")):
             if not f.endswith(".mp4"):
               try: os.remove(os.path.join("media_video",f))
@@ -256,10 +277,11 @@ jobs:
           if not downloaded:
             print("No videos saved; skipping frames."); raise SystemExit(0)
 
-          # frames
           def dur(path):
             try:
-              out=subprocess.check_output(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]).decode().strip()
+              out=subprocess.check_output(
+                ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
+              ).decode().strip()
               return float(out) if out else None
             except: return None
 
@@ -272,11 +294,10 @@ jobs:
             for i,t in enumerate(stamps,1):
               out=os.path.join(tgt,f"frame_{i:02d}.jpg")
               subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               print("Saved", out)
           PY
 
-      # 4) OpenAI: Motif (Vision) + Caption Intent + Territory -> merge back into latest_posts.csv
       - name: Classify motifs + caption intent + territory (OpenAI)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -292,15 +313,12 @@ jobs:
 
           posts = pd.read_csv("pipeline/latest_posts.csv")
 
-          # ---- Motif Vision (5 frames: start, 25%, 50%, 75%, end) ----
           MOTIF_SYSTEM = """You classify social video frames into ONE visual motif:
-          1) Product Macro — close-up product/bottle, clean/frontal framing, brand codes.
-          2) Lifestyle / Environment — everyday routine scenes (desk, commute, gym bag), practical context.
-          3) Crowd POV — crowds, stage/pitch/event energy, spectacle, audience shots.
-          4) Creator POV — handheld/interview/training/prep; first-person or creator-led shots.
-          Return ONLY JSON: {"motif":"<label>","confidence":0-1,"reason":"<12 words>"}.
-          Choose a single best label considering all frames together.
-          """
+          1) Product Macro — close-up product/bottle, clean framing.
+          2) Lifestyle / Environment — everyday routine scenes (desk, commute, gym bag).
+          3) Crowd POV — crowds, event/stadium energy, spectacle.
+          4) Creator POV — handheld/interview/training/prep.
+          Return ONLY JSON: {"motif":"<label>","confidence":0-1,"reason":"<12 words>"}."""
 
           def enc_img(path):
             with open(path,"rb") as f:
@@ -310,62 +328,37 @@ jobs:
           @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
           def classify_motif(frames):
             content=[{"type":"input_text","text":MOTIF_SYSTEM}]
-            picks=[]
             if frames:
               idxs=[0, max(0,len(frames)//4), len(frames)//2, min(len(frames)-1, 3*len(frames)//4), len(frames)-1]
-              picks=[frames[i] for i in sorted(set(idxs))]
-            for p in picks: content.append(enc_img(p))
+              for i in sorted(set(idxs)): content.append(enc_img(frames[i]))
             resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":content}], temperature=0)
             return resp.choices[0].message.content.strip()
 
-          # ---- Caption Intent + Territory (text-only) ----
-          TERRITORY_DEFS = """Classify a MAS+ Instagram post into ONE territory, and an intent label.
-          Territories:
-          - Football / Messi Baseline — match/event/hero moments tied to Messi/football spectacle.
-          - Future Clarity — product/identity, macro visuals, clean setups, design clarity.
-          - Performance Mastery — discipline/routine/training, hydration rituals, pre/post-game focus.
-          - Creative Momentum — culture-native formats, creator POV, humour/trends, ambient lifestyle.
-          Intents:
-          - Participation / Prompt
-          - Focus / Discipline
-          - Product / Availability
-          - Celebration / Moment
-          Return ONLY JSON: {"territory":"<one>","intent":"<one>"}.
-          """
+          TERRITORY_DEFS = """Classify a MAS+ Instagram post into ONE territory and ONE intent.
+          Territories: Football / Messi Baseline; Future Clarity; Performance Mastery; Creative Momentum.
+          Intents: Participation / Prompt; Focus / Discipline; Product / Availability; Celebration / Moment.
+          Return ONLY JSON: {"territory":"<one>","intent":"<one>"}."""
 
           @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
           def classify_text(caption, motif_hint):
-            prompt = f"""{TERRITORY_DEFS}
-
-Motif hint: {motif_hint}
-Caption: {caption}"""
-            resp=client.chat.completions.create(
-              model="gpt-4o-mini",
-              messages=[{"role":"user","content":prompt}],
-              temperature=0
-            )
+            prompt=f"{TERRITORY_DEFS}\nMotif hint: {motif_hint}\nCaption: {caption}"
+            resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], temperature=0)
             return resp.choices[0].message.content.strip()
 
-          # run per post
-          motifs=[]
+          rows=[]
           for _, r in posts.iterrows():
             sc=str(r.get("shortCode") or "")
-            frame_dir=os.path.join("frames_video", sc)
-            frames=sorted(glob.glob(os.path.join(frame_dir,"frame_*.jpg")))
-            # default motif if no frames
+            frames=sorted(glob.glob(os.path.join("frames_video",sc,"frame_*.jpg")))
             motif_json='{"motif":"Lifestyle / Environment","confidence":0.5,"reason":"no frames"}'
             if frames:
               try: motif_json=classify_motif(frames)
               except Exception as e: print("motif error", sc, e)
-            # parse motif
             try:
               mj=json.loads(motif_json); 
               if isinstance(mj,str): mj=json.loads(mj)
               motif_label=mj.get("motif","Lifestyle / Environment"); motif_conf=mj.get("confidence",0.5)
             except Exception:
               m=re.search(r'"motif"\s*:\s*"([^"]+)"', motif_json); motif_label=m.group(1) if m else "Lifestyle / Environment"; motif_conf=0.5
-
-            # text classification using caption + motif hint
             try:
               text_json=classify_text(r.get("caption",""), motif_label)
               tj=json.loads(text_json); 
@@ -373,18 +366,14 @@ Caption: {caption}"""
               terr=tj.get("territory","Future Clarity"); intent=tj.get("intent","Celebration / Moment")
             except Exception:
               terr="Future Clarity"; intent="Celebration / Moment"
+            rows.append({"shortCode":sc,"Motif_v1":motif_label,"Motif_conf":motif_conf,"Caption_Intent_v1":intent,"Assigned_Territory_v4":terr})
 
-            motifs.append({"shortCode":sc,"Motif_v1":motif_label,"Motif_conf":motif_conf,
-                           "Caption_Intent_v1":intent,"Assigned_Territory_v4":terr})
-
-          # merge back into latest_posts.csv
-          add=pd.DataFrame(motifs)
+          add=pd.DataFrame(rows)
           merged=posts.merge(add, on="shortCode", how="left")
           merged.to_csv("pipeline/latest_posts.csv", index=False)
-          print("Merged back into latest_posts.csv with motif/intent/territory.")
+          print("Merged into latest_posts.csv")
           PY
 
-      # 5) Publish Notion weekly card with motif + territory narrative and per-post bullets
       - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -395,7 +384,8 @@ Caption: {caption}"""
           import os, json, pandas as pd, requests
           from datetime import datetime, timezone
 
-          NOTION_TOKEN=os.environ["NOTION_TOKEN"]; DB_ID=os.environ["NOTION_DB_MASPLUS"]
+          NOTION_TOKEN=os.environ["NOTION_TOKEN"]
+          DB_ID=os.environ["NOTION_DB_MASPLUS"]
           H={"Authorization":f"Bearer {NOTION_TOKEN}","Notion-Version":"2022-06-28","Content-Type":"application/json"}
 
           def rt(x): return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
@@ -403,17 +393,15 @@ Caption: {caption}"""
           def sel(x): return {"select":{"name":x}}
 
           posts=pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
-
           week=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-          n=len(posts)
 
-          motif_counts=posts["Motif_v1"].value_counts(dropna=False).to_dict() if "Motif_v1" in posts else {}
-          terr_counts =posts["Assigned_Territory_v4"].value_counts(dropna=False).to_dict() if "Assigned_Territory_v4" in posts else {}
+          motif_counts=posts.get("Motif_v1",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+          terr_counts =posts.get("Assigned_Territory_v4",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
 
           motif_line=" • ".join([f"{k}: {v}" for k,v in motif_counts.items()]) if motif_counts else "No motifs"
           terr_line =" • ".join([f"{k}: {v}" for k,v in terr_counts.items()])  if terr_counts  else "No territories"
 
-          summary=f"Posts: {n} | Motifs: {motif_line} | Territories: {terr_line}"
+          summary=f"Posts: {len(posts)} | Motifs: {motif_line} | Territories: {terr_line}"
 
           bullets=[]
           for _,r in posts.iterrows():
@@ -428,15 +416,15 @@ Caption: {caption}"""
               "Insight Type":sel("Weekly Motifs"),
               "Headline":rt(f"Weekly Motifs & Territories — {week}"),
               "Status":sel("Published"),
-              "Title":ttl("Weekly Motifs & Territories"),
+              "Title":ttl("Weekly Motifs & Territories")
             },
             "children":[{"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":body[:1900]}}]}}]
           }
+
           r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
           print("Notion:", r.status_code, r.text[:200])
           PY
 
-      # 6) Upload artifacts
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
