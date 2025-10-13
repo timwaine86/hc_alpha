@@ -89,6 +89,15 @@ jobs:
           echo "== printing first 60 lines of pipeline/baseline_check.py =="
           sed -n '1,60p' pipeline/baseline_check.py
 
+      - name: Upload raw & normalised CSVs (artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: apify_csvs
+          path: |
+            pipeline/latest_posts_raw.csv
+            pipeline/latest_posts.csv
+
+
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
