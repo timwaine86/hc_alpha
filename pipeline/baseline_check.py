@@ -112,7 +112,7 @@ def classify_missing_territories(df):
     if 'dt_series' not in globals():
         return df
 
-    cutoff_cls = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=60)
+    cutoff_cls = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=60)
     mask_recent = dt_series >= cutoff_cls
 
     terr_col = None
@@ -237,7 +237,7 @@ elif "views" in df.columns:
     df["IVR"] = ((df["likes"]+df["comments"])/df["views"].replace(0,pd.NA))*100
 
 # ---------- 30-day window ----------
-cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=30)
+cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)
 mask = dt_series >= cutoff
 latest = df.loc[mask].copy()
 if latest.empty:
