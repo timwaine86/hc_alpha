@@ -196,16 +196,56 @@ jobs:
           print(clean.head(10).to_string(index=False))
           PY
 
-      # 3) Upload artifacts so you can inspect results
-      - name: Upload raw & normalised CSVs (artifacts)
+      # 3) Create a media manifest (no downloads yet) so you can inspect media columns
+      - name: Create media manifest (no downloads yet)
+        run: |
+          python - <<'PY'
+          import pandas as pd, re
+
+          raw = pd.read_csv("pipeline/latest_posts_raw.csv")
+          clean = pd.read_csv("pipeline/latest_posts.csv")
+
+          def find(cols, pattern):
+            return [c for c in cols if re.search(pattern, c, re.I)]
+
+          url_cols  = find(raw.columns, r'(display|image|thumb|media|video).*url$|^url$')
+          type_cols = find(raw.columns, r'(is|media).*video|product.*type|type$')
+          id_cols   = find(raw.columns, r'shortcode$|^short[_]?code$|postid$|id$')
+
+          id_col = id_cols[0] if id_cols else None
+
+          media_type = None
+          if type_cols:
+            t = raw[type_cols[0]].astype(str).str.lower()
+            media_type = t.map(lambda x: 'video' if ('true' in x or 'video' in x) else 'image')
+
+          out = {}
+          out['post_id']    = raw[id_col] if id_col else pd.Series(range(len(raw)))
+          out['media_type'] = media_type if media_type is not None else pd.Series(['unknown']*len(raw))
+
+          for c in url_cols:
+            out[c] = raw[c]
+
+          out['shortCode'] = clean.get('shortCode')
+
+          manifest = pd.DataFrame(out)
+          manifest.to_csv("pipeline/media_manifest.csv", index=False)
+
+          print("Manifest columns:", list(manifest.columns))
+          print("Sample rows:\n", manifest.head(10).to_string(index=False))
+          PY
+
+      # 4) Upload artifacts so you can inspect results locally
+      - name: Upload raw, normalised & manifest CSVs (artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: apify_csvs
+          name: apify_csvs_and_manifest
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
+            pipeline/media_manifest.csv
 
-      # 4) (Optional) Run your baseline script as before
+      # 5) (Optional) Run your baseline script as before
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
