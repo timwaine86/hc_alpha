@@ -91,26 +91,91 @@ jobs:
           echo "Raw CSV preview:"
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize: parent posts only, add date_v4, dedupe by shortcode, latest 30
+      # 2) Normalize: robust shortCode + timestamp discovery; parent posts only; latest 30
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
-          import pandas as pd, numpy as np
+          import pandas as pd, numpy as np, re
 
           src = "pipeline/latest_posts_raw.csv"
           dst = "pipeline/latest_posts.csv"
-
           df = pd.read_csv(src, dtype=str, keep_default_na=False)
 
+          # Map case-insensitive names
           lower = {c.lower(): c for c in df.columns}
           def col(*names):
             for n in names:
-              if n.lower() in lower: return lower[n.lower()]
+              if n and n.lower() in lower:
+                return lower[n.lower()]
             return None
 
-          sc_col   = col("shortCode","short_code","shortcode")
-          ts_col   = col("timestamp","takenAt","taken_at","published_time")
-          url_col  = col("postUrl","url","permalink","link")
+          # Candidate columns
+          sc_col = col("shortCode","short_code","shortcode")
+          posturl_col = col("postUrl","url","permalink","link")
+
+          # Try to extract shortCode from URL if missing
+          if not sc_col and posturl_col:
+            # build a derived shortCode column
+            def extract_sc(u):
+              u = str(u)
+              m = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)/?", u)
+              return m.group(1) if m else ""
+            df["__shortCode_from_url"] = df[posturl_col].map(extract_sc)
+            sc_col = "__shortCode_from_url"
+
+          # Timestamp candidates (ISO or numeric)
+          ts_candidates = [
+            "timestamp","takenAt","taken_at","takenAtISO","taken_at_iso","takenAtUtc","taken_at_utc",
+            "takenAtTimestamp","taken_at_timestamp","created_time","createdAt","published_time",
+            "date","time","datetime"
+          ]
+          ts_cols = [c for c in (col(x) for x in ts_candidates) if c]
+
+          def parse_ts_row(row):
+            for c in ts_cols:
+              val = str(row.get(c,"")).strip()
+              if not val:
+                continue
+              # try ISO first
+              dt = pd.to_datetime(val, errors="coerce", utc=True)
+              if pd.notna(dt):
+                return dt
+              # try seconds then ms
+              num = pd.to_numeric(val, errors="coerce")
+              if pd.notna(num):
+                for unit in ["s","ms"]:
+                  dt = pd.to_datetime(num, unit=unit, errors="coerce", utc=True)
+                  if pd.notna(dt):
+                    return dt
+            return pd.NaT
+
+          # Build parent-only frame with derived fields
+          df["_sc"] = df[sc_col] if sc_col else ""
+          if isinstance(df["_sc"], str):
+            df["_sc"] = df["_sc"].astype(str)
+          df["_sc"] = df["_sc"].astype(str).str.strip()
+
+          if posturl_col:
+            df["_postUrl"] = df[posturl_col]
+          else:
+            df["_postUrl"] = ""
+
+          # Parse timestamps row-wise
+          dt_series = df.apply(parse_ts_row, axis=1)
+          df["_dt"] = dt_series
+
+          # Keep only rows with a shortcode and a timestamp
+          parent = df.loc[(df["_sc"].ne("")) & (df["_dt"].notna())].copy()
+          if parent.empty:
+            print("No parent rows with shortCode + timestamp found. Raw columns:", list(df.columns))
+            # write an empty but valid file so downstream steps don't explode
+            pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption",
+                                  "likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst, index=False)
+            raise SystemExit(0)
+
+          parent["date_v4"] = parent["_dt"].dt.strftime("%Y-%m-%d")
+
+          # Other optional fields
           type_col = col("type","productType","media_type")
           cap_col  = col("caption","caption_v4","caption_v3")
           like_col = col("likesCount","likes","like_count","edge_media_preview_like.count")
@@ -119,37 +184,35 @@ jobs:
           disp_col = col("displayUrl","imageUrl","thumbnailUrl","display_url")
           vid_col  = col("videoUrl","video_url")
 
-          def nonempty(s): return s.astype(str).str.strip().ne("") if s is not None else pd.Series(False, index=df.index)
-
-          if not sc_col or not ts_col: raise SystemExit("Missing shortCode/timestamp.")
-          dfp = df.loc[nonempty(df[sc_col]) & nonempty(df[ts_col])].copy()
-
-          dt = pd.to_datetime(dfp[ts_col], errors="coerce", utc=True)
-          dfp = dfp.loc[dt.notna()].copy()
-          dfp["__dt"] = dt.loc[dt.notna()]
-          dfp["date_v4"] = dfp["__dt"].dt.strftime("%Y-%m-%d")
-
-          keep_cols = {
-            "shortCode": sc_col, "postUrl": url_col, "caption": cap_col, "type": type_col,
-            "likesCount": like_col, "commentsCount": com_col, "videoViewCount": vvc_col,
-            "displayUrl": disp_col, "videoUrl": vid_col, "date_v4": "date_v4", "__dt": "__dt",
-          }
-
+          # Take first non-empty per shortcode
           def first_nonempty(series):
             for v in series:
               s = str(v) if pd.notna(v) else ""
-              if s.strip(): return s
+              if s.strip():
+                return s
             return ""
 
           rows=[]
-          for sc, grp in dfp.groupby(sc_col):
-            row={}
-            for out, src_col in keep_cols.items():
-              row[out] = first_nonempty(grp[src_col]) if (src_col in grp.columns) else ""
-            vvc = row.get("videoViewCount","")
-            if vvc != "":
-              try: row["views"] = str(int(float(vvc)))
-              except: row["views"] = vvc
+          for sc, grp in parent.groupby("_sc"):
+            row = {
+              "shortCode": sc,
+              "postUrl": first_nonempty(grp["_postUrl"]),
+              "caption": first_nonempty(grp[cap_col]) if cap_col in grp.columns else "",
+              "type": first_nonempty(grp[type_col]) if type_col in grp.columns else "",
+              "likesCount": first_nonempty(grp[like_col]) if like_col in grp.columns else "",
+              "commentsCount": first_nonempty(grp[com_col]) if com_col in grp.columns else "",
+              "displayUrl": first_nonempty(grp[disp_col]) if disp_col in grp.columns else "",
+              "videoUrl": first_nonempty(grp[vid_col]) if vid_col in grp.columns else "",
+              "date_v4": first_nonempty(grp["date_v4"]),
+              "__dt": grp["_dt"].max(),
+            }
+            # map views from any numeric video view field if present
+            if vvc_col and vvc_col in grp.columns:
+              try:
+                vv = pd.to_numeric(grp[vvc_col].replace("", np.nan), errors="coerce").max()
+                row["views"] = "" if pd.isna(vv) else str(int(vv))
+              except Exception:
+                row["views"] = first_nonempty(grp[vvc_col])
             else:
               row["views"] = ""
             rows.append(row)
@@ -158,15 +221,16 @@ jobs:
           clean["__dt"] = pd.to_datetime(clean["__dt"], errors="coerce", utc=True)
           clean = clean.sort_values("__dt", ascending=False).head(30).reset_index(drop=True)
 
+          # Final tidy
           final_cols = ["date_v4","shortCode","postUrl","type","caption",
                         "likesCount","commentsCount","views","displayUrl","videoUrl"]
           for c in final_cols:
-            if c not in clean.columns: clean[c] = ""
+            if c not in clean.columns:
+              clean[c] = ""
           clean = clean[final_cols]
-
           clean.to_csv(dst, index=False)
-          print("Wrote tidy CSV:", dst)
-          print("Columns:", list(clean.columns))
+
+          print("Normalized columns:", list(clean.columns))
           print(clean.head(10).to_string(index=False))
           PY
 
@@ -200,67 +264,62 @@ jobs:
           pd.DataFrame(out).to_csv("pipeline/media_manifest.csv", index=False)
           PY
 
-      # 4) Download up to 5 IG videos with yt-dlp from postUrl, then extract 10 frames per video
+      # 4) Download IG videos (yt-dlp) and extract 10 frames each
       - name: Download IG videos (yt-dlp) and extract 10 frames each
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, subprocess, shlex, pandas as pd, math, json
+          import os, subprocess, shlex, pandas as pd
 
           os.makedirs("media_video", exist_ok=True)
           os.makedirs("frames_video", exist_ok=True)
 
           df = pd.read_csv("pipeline/latest_posts.csv")
           urls = []
-          # Prefer rows likely to be videos: if 'videoUrl' populated OR type hints at video; else just use postUrl
           for _, r in df.iterrows():
             u = str(r.get("postUrl") or "").strip()
-            if u.startswith("http"): urls.append(u)
-          # Deduplicate while preserving order
+            if u.startswith("http"):
+              urls.append(u)
+          # preserve order, remove dups
           seen=set(); urls=[u for u in urls if not (u in seen or seen.add(u))]
 
-          # Try to download up to 5 videos
           downloaded = []
           for u in urls:
             if len(downloaded) >= 5: break
             print("Attempting video download:", u)
-            # Best effort MP4; yt-dlp will pick the right extractor
             cmd = f"yt-dlp -S ext:mp4:m4a --no-warnings -o 'media_video/%(id)s.%(ext)s' {shlex.quote(u)}"
             rc = subprocess.run(cmd, shell=True).returncode
             if rc == 0:
-              # pick the newest mp4 in the folder as the file we just downloaded
               mp4s = sorted([f for f in os.listdir('media_video') if f.endswith('.mp4')], key=lambda x: os.path.getmtime(os.path.join('media_video',x)), reverse=True)
               if mp4s:
-                downloaded.append(os.path.join('media_video', mp4s[0]))
-                print("Downloaded:", downloaded[-1])
+                path=os.path.join('media_video', mp4s[0])
+                downloaded.append(path)
+                print("Downloaded:", path)
             else:
               print("yt-dlp failed (non-fatal).")
 
           if not downloaded:
-            print("No videos downloaded; nothing to frame-extract.")
+            print("No videos downloaded; skipping frame extraction.")
             raise SystemExit(0)
 
-          def probe_duration(path):
+          def ffprobe_duration(path):
             try:
-              cmd = ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
-              out = subprocess.check_output(cmd).decode("utf-8").strip()
+              out = subprocess.check_output(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]).decode().strip()
               return float(out) if out else None
             except Exception:
               return None
 
-          # Extract exactly 10 evenly spaced frames per video
           for vid in downloaded:
             base = os.path.splitext(os.path.basename(vid))[0]
-            dur = probe_duration(vid)
+            dur = ffprobe_duration(vid)
             if not dur or dur <= 0:
               print("Could not probe duration for", vid)
               continue
-            # 10 timestamps evenly spaced excluding 0 and end
-            stamps = [(i+1)*dur/11 for i in range(10)]
-            for idx, t in enumerate(stamps, 1):
+            stamps = [(i+1)*dur/11 for i in range(10)]  # 10 evenly spaced
+            for idx,t in enumerate(stamps,1):
               out = f"frames_video/{base}_frame_{idx:02d}.jpg"
-              cmd = ["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out]
-              subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               print("Saved frame:", out)
           PY
 
