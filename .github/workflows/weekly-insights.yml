@@ -28,8 +28,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity
+          pip install pandas python-dateutil python-dotenv requests openai==1.51.2 tenacity numpy
 
+      # 1) Start Apify actor (async) -> poll until SUCCEEDED -> download CSV
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -38,57 +39,164 @@ jobs:
           mkdir -p pipeline
           OUT_RAW="pipeline/latest_posts_raw.csv"
           RUN_JSON="pipeline/apify_run.json"
+
           JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":30,"proxy":{"useApifyProxy":true}}'
-          curl -sS -X POST -H "Authorization: Bearer ${APIFY_TOKEN}" -H "Content-Type: application/json" \
+
+          # Start run (async)
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${APIFY_TOKEN}" \
+            -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
-            -d "${JSON_PAYLOAD}" -o "${RUN_JSON}"
+            -d "${JSON_PAYLOAD}" \
+            -o "${RUN_JSON}"
+
           RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
-          [ -n "${RUN_ID}" ] || { echo "Failed to start Apify run"; sed -n '1,200p' "${RUN_JSON}"; exit 1; }
+          if [ -z "${RUN_ID}" ]; then
+            echo "Failed to start Apify run."
+            sed -n '1,200p' "${RUN_JSON}" || true
+            exit 1
+          fi
+          echo "Apify run started: ${RUN_ID}"
+
+          # Poll until SUCCEEDED
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("status",""))' || true)
-            echo "status: ${STATUS}"
-            [ "${STATUS}" = "SUCCEEDED" ] && break
-            case "${STATUS}" in FAILED|TIMED-OUT|ABORTED) echo "${RESP}"; exit 1;; esac
+            echo "  status: ${STATUS}"
+            if [ "${STATUS}" = "SUCCEEDED" ]; then
+              break
+            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED-OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
+              echo "Run ended with status: ${STATUS}"
+              printf "%s\n" "${RESP}" | sed -n '1,200p'
+              exit 1
+            fi
             sleep 30
           done
-          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
-          [ -n "${DATASET_ID}" ] || { echo "No dataset id"; echo "${RESP}"; exit 1; }
-          curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
-          [ -s "${OUT_RAW}" ] || { echo "Empty CSV"; exit 1; }
-          echo "Raw CSV preview:"; head -5 "${OUT_RAW}"
 
+          DATASET_ID=$(printf "%s" "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("data",{}).get("defaultDatasetId",""))')
+          if [ -z "${DATASET_ID}" ]; then
+            echo "No dataset id found."
+            printf "%s\n" "${RESP}" | sed -n '1,200p'
+            exit 1
+          fi
+
+          curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
+          if [ ! -s "${OUT_RAW}" ]; then
+            echo "Downloaded CSV is empty."
+            exit 1
+          fi
+
+          echo "Raw CSV preview:"
+          head -5 "${OUT_RAW}"
+
+      # 2) Normalize: keep only real parent posts, add date_v4, dedupe, keep latest 30, tidy columns
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
-          import pandas as pd
-          src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
-          df=pd.read_csv(src)
-          lower={c.lower():c for c in df.columns}
-          candidates=["date_v4","date_v3","date","timestamp","takenat","taken_at","published_time","takenatiso","created_time"]
-          col=next((lower[c] for c in candidates if c in lower),None)
-          if not col: raise SystemExit(f"No date-like column. Columns: {list(df.columns)}")
-          s=df[col]; d=pd.to_datetime(s,errors="coerce",utc=True)
-          if d.isna().all():
-            d=pd.to_datetime(pd.to_numeric(s,errors="coerce"),unit="s",utc=True)
-            if d.isna().all():
-              d=pd.to_datetime(pd.to_numeric(s,errors="coerce"),unit="ms",utc=True)
-          if d.isna().all(): raise SystemExit(f"Could not parse dates from {col}")
-          df["date_v4"]=d.dt.strftime("%Y-%m-%d")
-          ren={}
-          if "shortcode" in lower: ren[lower["shortcode"]]="shortCode"
-          if "short_code" in lower: ren[lower["short_code"]]="shortCode"
-          if "url" in lower: ren[lower["url"]]="postUrl"
-          df=df.rename(columns=ren)
-          df.to_csv(dst,index=False)
-          print("Normalized columns:",list(df.columns)); print(df.head(5).to_string())
+          import pandas as pd, numpy as np
+
+          src = "pipeline/latest_posts_raw.csv"
+          dst = "pipeline/latest_posts.csv"
+
+          # Read as string to avoid coercions
+          df = pd.read_csv(src, dtype=str, keep_default_na=False)
+
+          # Helper to map case-insensitive column names
+          lower = {c.lower(): c for c in df.columns}
+          def col(*names):
+            for n in names:
+              if n.lower() in lower:
+                return lower[n.lower()]
+            return None
+
+          sc_col   = col("shortCode","short_code","shortcode")
+          ts_col   = col("timestamp","takenAt","taken_at","published_time")
+          url_col  = col("postUrl","url","permalink","link")
+          type_col = col("type","productType","media_type")
+          cap_col  = col("caption","caption_v4","caption_v3")
+          like_col = col("likesCount","likes","like_count","edge_media_preview_like.count")
+          com_col  = col("commentsCount","comments","comment_count")
+          vvc_col  = col("videoViewCount","video_views","playCount","videoPlayCount")
+          disp_col = col("displayUrl","imageUrl","thumbnailUrl","display_url")
+          vid_col  = col("videoUrl","video_url")
+
+          def nonempty(s):
+            return s.astype(str).str.strip().ne("") if s is not None else pd.Series(False, index=df.index)
+
+          # Keep only rows with a shortcode AND a timestamp (parent posts, not child rows)
+          if not sc_col or not ts_col:
+            raise SystemExit("Missing required columns for normalization (shortCode/timestamp).")
+          mask_parent = nonempty(df[sc_col]) & nonempty(df[ts_col])
+          dfp = df.loc[mask_parent].copy()
+
+          # Parse timestamp -> datetime (UTC), derive date_v4
+          dt = pd.to_datetime(dfp[ts_col], errors="coerce", utc=True)
+          dfp = dfp.loc[dt.notna()].copy()
+          dfp["__dt"] = dt.loc[dt.notna()]
+          dfp["date_v4"] = dfp["__dt"].dt.strftime("%Y-%m-%d")
+
+          # Build per-shortCode rows, taking first non-empty value per field
+          keep_cols = {
+            "shortCode": sc_col,
+            "postUrl": url_col,
+            "caption": cap_col,
+            "type": type_col,
+            "likesCount": like_col,
+            "commentsCount": com_col,
+            "videoViewCount": vvc_col,
+            "displayUrl": disp_col,
+            "videoUrl": vid_col,
+            "date_v4": "date_v4",
+            "__dt": "__dt",
+          }
+
+          def first_nonempty(series):
+            for v in series:
+              s = str(v) if pd.notna(v) else ""
+              if s.strip():
+                return s
+            return ""
+
+          grouped = []
+          for sc, grp in dfp.groupby(sc_col):
+            row = {}
+            for out, src_col in keep_cols.items():
+              if src_col not in grp.columns:
+                row[out] = ""
+              else:
+                row[out] = first_nonempty(grp[src_col])
+            # views from videoViewCount if present
+            vvc = row.get("videoViewCount","")
+            if vvc != "":
+              try:
+                row["views"] = str(int(float(vvc)))
+              except:
+                row["views"] = vvc
+            else:
+              row["views"] = ""
+            grouped.append(row)
+
+          clean = pd.DataFrame(grouped)
+
+          # Sort by datetime desc and limit to latest 30
+          clean["__dt"] = pd.to_datetime(clean["__dt"], errors="coerce", utc=True)
+          clean = clean.sort_values("__dt", ascending=False).head(30).reset_index(drop=True)
+
+          # Final tidy columns (IG-clean style)
+          final_cols = ["date_v4","shortCode","postUrl","type","caption",
+                        "likesCount","commentsCount","views","displayUrl","videoUrl"]
+          for c in final_cols:
+            if c not in clean.columns:
+              clean[c] = ""
+          clean = clean[final_cols]
+
+          clean.to_csv(dst, index=False)
+          print("Wrote tidy CSV:", dst)
+          print("Columns:", list(clean.columns))
+          print(clean.head(10).to_string(index=False))
           PY
 
-      - name: Show baseline_check.py header (debug)
-        run: |
-          echo "== printing first 60 lines of pipeline/baseline_check.py =="
-          sed -n '1,60p' pipeline/baseline_check.py
-
+      # 3) Upload artifacts so you can inspect results
       - name: Upload raw & normalised CSVs (artifacts)
         uses: actions/upload-artifact@v4
         with:
@@ -97,7 +205,7 @@ jobs:
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
 
-
+      # 4) (Optional) Run your baseline script as before
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
