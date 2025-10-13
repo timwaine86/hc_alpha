@@ -234,6 +234,64 @@ jobs:
           print("Manifest columns:", list(manifest.columns))
           print("Sample rows:\n", manifest.head(10).to_string(index=False))
           PY
+          
+           - name: Download a tiny media sample (3 images, 2 videos)
+          run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pandas as pd, os, re, requests
+
+          m = pd.read_csv("pipeline/media_manifest.csv")
+          url_cols = [c for c in m.columns if re.search(r'url', c, re.I)]
+
+          def first_url(row):
+            for c in url_cols:
+              u = str(row.get(c) or '')
+              if u.startswith('http'):
+                return u
+            return None
+
+          # pick 3 images + 2 videos based on media_type if present, else by presence of 'video' in URL column name
+          def row_is_video(row):
+            mt = str(row.get('media_type','')).lower()
+            if mt in ('video', 'true'): return True
+            # fall back: any url column name contains 'video'
+            return any('video' in c.lower() for c in url_cols)
+
+          imgs, vids = [], []
+          for _, r in m.iterrows():
+            u = first_url(r)
+            if not u: continue
+            if row_is_video(r):
+              if len(vids) < 2: vids.append(u)
+            else:
+              if len(imgs) < 3: imgs.append(u)
+            if len(imgs) >= 3 and len(vids) >= 2: break
+
+          print("Selected images:", imgs)
+          print("Selected videos:", vids)
+
+          os.makedirs("media_sample", exist_ok=True)
+          sess = requests.Session()
+
+          def dl(url, out):
+            try:
+              with sess.get(url, timeout=45, stream=True) as resp:
+                resp.raise_for_status()
+                with open(out, "wb") as f:
+                  for chunk in resp.iter_content(8192):
+                    if chunk: f.write(chunk)
+              print("Saved", out)
+            except Exception as e:
+              print("Download failed:", url, e)
+
+          for i,u in enumerate(imgs,1):
+            dl(u, f"media_sample/img_{i}.jpg")
+          for i,u in enumerate(vids,1):
+            ext = ".mp4" if ".mp4" in u.lower() else ".bin"
+            dl(u, f"media_sample/vid_{i}{ext}")
+          PY
+
 
       # 4) Upload artifacts so you can inspect results locally
       - name: Upload raw, normalised & manifest CSVs (artifacts)
