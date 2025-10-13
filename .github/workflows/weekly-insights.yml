@@ -187,62 +187,97 @@ jobs:
           pd.DataFrame(out).to_csv("pipeline/media_manifest.csv",index=False)
           PY
 
-      # 4) Write Instagram cookies for yt-dlp (if provided)
-      - name: Prepare IG cookies (optional)
+      # 4) Download videos: try direct videoUrl first; if not enough, fall back to yt-dlp with headers/cookies; extract 10 frames each
+      - name: Download IG videos and extract 10 frames each
         env:
-          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
-        run: |
-          set -euo pipefail
-          if [ -n "${IG_SESSIONID:-}" ]; then
-            echo -e "# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSIONID}" > cookies.txt
-            echo "Cookies written to cookies.txt"
-          else
-            echo "No IG_SESSIONID secret set — proceeding without cookies (downloads may fail)."
-          fi
-
-      # 5) Download up to 10 IG videos with yt-dlp + extract 10 frames each; keep only MP4s
-      - name: Download IG videos (yt-dlp) and extract 10 frames each
+          IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
+          IG_DS_USER_ID:  ${{ secrets.IG_DS_USER_ID }}
+          IG_CSRF:        ${{ secrets.IG_CSRF }}
+          IG_RUR:         ${{ secrets.IG_RUR }}
+          IG_MID:         ${{ secrets.IG_MID }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, subprocess, shlex, pandas as pd, time
+          import os, time, shlex, subprocess, pandas as pd, requests
 
           os.makedirs("media_video", exist_ok=True)
           os.makedirs("frames_video", exist_ok=True)
 
           df = pd.read_csv("pipeline/latest_posts.csv")
 
-          # Prioritise likely-video rows (videoUrl present, type says video/reel, or URL path contains /reel/)
-          candidates = []
+          # ---- 1) Try direct CDN download from videoUrl (fastest, no cookie) ----
+          direct = []
+          s = requests.Session()
+          headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36",
+                     "Referer": "https://www.instagram.com/"}
+
           for _, r in df.iterrows():
-            u = str(r.get("postUrl") or "").strip()
             vu = str(r.get("videoUrl") or "").strip()
-            t  = str(r.get("type") or "").lower()
-            score = 0
-            if vu.startswith("http"): score += 2
-            if "/reel/" in u or "video" in t: score += 1
-            if u.startswith("http"):
-              candidates.append((score, u))
-          candidates.sort(key=lambda x: x[0], reverse=True)
-          urls = []
-          seen=set()
-          for score, u in candidates:
-            if u not in seen:
-              urls.append(u); seen.add(u)
-            if len(urls) >= 120:  # scan deeper to increase hit rate
+            sc = str(r.get("shortCode") or "").strip()
+            if not vu or not sc:
+              continue
+            try:
+              with s.get(vu, headers=headers, stream=True, timeout=45) as resp:
+                ct = (resp.headers.get("Content-Type") or "").lower()
+                if resp.status_code == 200 and "video/mp4" in ct:
+                  out = f"media_video/{sc}.mp4"
+                  with open(out, "wb") as f:
+                    for chunk in resp.iter_content(8192):
+                      if chunk: f.write(chunk)
+                  print("Direct saved:", out)
+                  direct.append(out)
+            except Exception as e:
+              print("Direct download failed for", sc, e)
+            if len(direct) >= 10:
               break
 
-          print(f"Scanning {len(urls)} candidate post URLs for video…")
-          downloaded = []
+          # ---- 2) If fewer than 10, try yt-dlp with Cookie+UA+Referer on postUrl ----
+          target = 10
+          downloaded = list(direct)
 
-          def try_download(u, tries=2, sleep_s=2):
-            base = "yt-dlp --no-playlist -S ext:mp4:m4a --merge-output-format mp4 --no-keep-video --no-keep-fragments --no-warnings -o 'media_video/%(id)s.%(ext)s' "
-            if os.path.exists('cookies.txt'):
-              base += "--cookies cookies.txt "
-            cmd = base + shlex.quote(u)
+          # Build Cookie header from whatever we have
+          import os
+          cookie_parts = []
+          for name, envkey in [("sessionid","IG_SESSIONID"),
+                               ("ds_user_id","IG_DS_USER_ID"),
+                               ("csrftoken","IG_CSRF"),
+                               ("rur","IG_RUR"),
+                               ("mid","IG_MID")]:
+            val = os.environ.get(envkey,"").strip()
+            if val:
+              cookie_parts.append(f"{name}={val}")
+          cookie_hdr = "; ".join(cookie_parts)
+
+          ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
+          add_headers = []
+          add_headers += ["--add-header", f"User-Agent:{ua}"]
+          add_headers += ["--add-header", "Referer:https://www.instagram.com/"]
+          if cookie_hdr:
+            add_headers += ["--add-header", f"Cookie:{cookie_hdr}"]
+
+          # Prioritise likely videos (reel/video)
+          candidates = []
+          seen = set()
+          for _, r in df.iterrows():
+            u = str(r.get("postUrl") or "").strip()
+            if not u or u in seen:
+              continue
+            score = 0
+            if "/reel/" in u: score += 2
+            score += 1  # at least try it
+            candidates.append((score, u))
+            seen.add(u)
+          candidates.sort(key=lambda x: x[0], reverse=True)
+          urls = [u for _,u in candidates][:120]  # scan deeper
+
+          def try_ytdlp(u, tries=2, sleep_s=2):
+            base = ["yt-dlp", "--no-playlist", "-S", "ext:mp4:m4a", "--merge-output-format", "mp4",
+                    "--no-keep-video", "--no-keep-fragments", "--no-warnings",
+                    "-o", "media_video/%(id)s.%(ext)s"]
+            cmd = base + add_headers + [u]
             for k in range(tries):
               print(f"[yt-dlp {k+1}/{tries}] {u}")
-              rc = subprocess.run(cmd, shell=True).returncode
+              rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
               if rc == 0:
                 mp4s = sorted([f for f in os.listdir('media_video') if f.endswith('.mp4')],
                               key=lambda x: os.path.getmtime(os.path.join('media_video',x)), reverse=True)
@@ -252,22 +287,24 @@ jobs:
             return None
 
           for u in urls:
-            if len(downloaded) >= 10: break
-            path = try_download(u)
-            if path:
+            if len(downloaded) >= target:
+              break
+            path = try_ytdlp(u)
+            if path and path not in downloaded:
               downloaded.append(path)
-              print("Downloaded:", path)
+              print("yt-dlp saved:", path)
 
-          # Remove non-mp4 leftovers to save space
+          # Clean up non-mp4 left-overs
           for f in list(os.listdir('media_video')):
             if not f.endswith('.mp4'):
               try: os.remove(os.path.join('media_video', f))
               except: pass
 
           if not downloaded:
-            print("No videos downloaded; skipping frame extraction.")
+            print("No videos saved; skipping frames.")
             raise SystemExit(0)
 
+          # ---- 3) Extract 10 evenly spaced frames per video ----
           def ffprobe_duration(path):
             try:
               out = subprocess.check_output(
@@ -282,7 +319,7 @@ jobs:
             dur = ffprobe_duration(vid)
             if not dur or dur <= 0:
               print("Could not probe duration for", vid); continue
-            stamps = [(i+1)*dur/11 for i in range(10)]  # 10 evenly spaced frames
+            stamps = [(i+1)*dur/11 for i in range(10)]
             for idx,t in enumerate(stamps,1):
               out = f"frames_video/{base}_frame_{idx:02d}.jpg"
               subprocess.run(
@@ -292,7 +329,7 @@ jobs:
               print("Saved frame:", out)
           PY
 
-      # 6) Upload artifacts (CSVs, manifest, videos, frames)
+      # 5) Upload artifacts (CSVs, manifest, videos, frames)
       - name: Upload artifacts (csvs, manifest, videos, frames)
         uses: actions/upload-artifact@v4
         with:
@@ -304,7 +341,7 @@ jobs:
             media_video
             frames_video
 
-      # 7) (Optional) Baseline to Notion
+      # 6) (Optional) Baseline to Notion
       - name: Run baseline to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
