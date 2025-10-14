@@ -377,7 +377,7 @@ jobs:
       # -------------------------------------------------------
       # 5) Notion: populate all requested properties on a page
       # -------------------------------------------------------
-      - name: Publish weekly visual narrative to Notion
+            - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
@@ -444,7 +444,7 @@ jobs:
               "Metric":rt(metric_text),
               "Confidence":sel(conf_band),
               "Driver Tags":msel(driver_tags),
-              "Linked Posts":rt(linked_posts),
+              "Linked Post(s)":rt(linked_posts),   # <-- changed key here
               "Action":rt(action_text),
               "Impact Score":{"number":impact_score},
               "Debug Confidence":rt(dbg),
@@ -459,7 +459,7 @@ jobs:
           r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
           print("Notion:", r.status_code, r.text[:300])
           PY
-
+          
       # -----------------------
       # 6) Upload artifacts
       # -----------------------
