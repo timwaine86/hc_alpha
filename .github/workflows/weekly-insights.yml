@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -28,12 +28,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas python-dateutil python-dotenv requests numpy
+          pip install pandas python-dateutil python-dotenv requests numpy tenacity openai==1.51.2
           pip install yt-dlp
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      # 1) Fetch (async) -> raw CSV
+      # 1) Fetch from Apify (async poll) -> raw CSV
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -42,23 +42,17 @@ jobs:
           mkdir -p pipeline
           OUT_RAW="pipeline/latest_posts_raw.csv"
           RUN_JSON="pipeline/apify_run.json"
-
           JSON_PAYLOAD='{"username":["masbymessi"],"maxItems":100,"proxy":{"useApifyProxy":true}}'
-
           curl -sS -X POST \
             -H "Authorization: Bearer ${APIFY_TOKEN}" \
             -H "Content-Type: application/json" \
             "https://api.apify.com/v2/acts/apify~instagram-post-scraper/runs?token=${APIFY_TOKEN}" \
             -d "${JSON_PAYLOAD}" \
             -o "${RUN_JSON}"
-
           RUN_ID=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("data",{}).get("id",""))' "${RUN_JSON}")
           if [ -z "${RUN_ID}" ]; then
-            echo "Failed to start Apify run"
-            sed -n '1,200p' "${RUN_JSON}" || true
-            exit 1
+            echo "Failed to start Apify run"; sed -n '1,200p' "${RUN_JSON}" || true; exit 1
           fi
-
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer ${APIFY_TOKEN}" "https://api.apify.com/v2/actor-runs/${RUN_ID}")
             STATUS=$(printf '%s' "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("data",{}).get("status",""))')
@@ -69,25 +63,20 @@ jobs:
             esac
             sleep 30
           done
-
           DATASET_ID=$(printf '%s' "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("data",{}).get("defaultDatasetId",""))')
           if [ -z "${DATASET_ID}" ]; then
             echo "No dataset id"; printf '%s\n' "${RESP}"; exit 1
           fi
-
           curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
-          if [ ! -s "${OUT_RAW}" ]; then
-            echo "Empty CSV"; exit 1
-          fi
+          if [ ! -s "${OUT_RAW}" ]; then echo "Empty CSV"; exit 1; fi
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize -> last 7 days, tidy columns
+      # 2) Normalize (7 days), robust shortCode/timestamp
       - name: Normalize CSV (weekly scope)
         run: |
           python - <<'PY'
           import pandas as pd, numpy as np, re
           from pandas import Timestamp, Timedelta
-
           src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
           df=pd.read_csv(src,dtype=str,keep_default_na=False)
           lower={c.lower():c for c in df.columns}
@@ -95,18 +84,14 @@ jobs:
               for n in names:
                   if n and n.lower() in lower: return lower[n.lower()]
               return None
-
-          sc=col("shortCode","short_code","shortcode")
-          url=col("postUrl","url","permalink","link")
+          sc=col("shortCode","short_code","shortcode"); url=col("postUrl","url","permalink","link")
           if not sc and url:
-              def from_url(u):
+              def from_url(u): 
                   m=re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)/?", str(u)); return m.group(1) if m else ""
               df["__sc"]=df[url].map(from_url); sc="__sc"
-
           ts_names=["timestamp","takenAt","taken_at","takenAtISO","taken_at_iso","takenAtUtc","taken_at_utc",
                     "takenAtTimestamp","taken_at_timestamp","created_time","createdAt","published_time","date","time","datetime"]
           ts_cols=[c for c in (col(x) for x in ts_names) if c]
-
           def parse_row(r):
               for c in ts_cols:
                   v=str(r.get(c,"")).strip()
@@ -119,81 +104,56 @@ jobs:
                           dt=pd.to_datetime(num,unit=unit,errors="coerce",utc=True)
                           if pd.notna(dt): return dt
               return pd.NaT
-
           df["_sc"]= (df[sc] if sc else "").astype(str).str.strip()
           df["_postUrl"]= df[url] if url else ""
           df["_dt"]= df.apply(parse_row,axis=1)
-
           now=Timestamp.now(tz="UTC"); cut=now-Timedelta(days=7)
           df=df.loc[df["_dt"].notna() & (df["_dt"]>=cut)].copy()
-
           if df.empty:
-              pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst,index=False)
-              raise SystemExit(0)
-
+              pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst,index=False); raise SystemExit(0)
           df["date_v4"]=df["_dt"].dt.strftime("%Y-%m-%d")
-
-          def first(grp, colname):
-              s=grp[colname] if colname in grp.columns else None
-              if s is None: return ""
-              for v in s:
-                  vv=str(v).strip()
-                  if vv: return vv
+          def first(grp, c):
+              if c and c in grp.columns:
+                  for v in grp[c]:
+                      vv=str(v).strip()
+                      if vv: return vv
               return ""
-
-          typec=col("type","productType","media_type")
-          capc =col("caption","caption_v4","caption_v3")
-          like =col("likesCount","likes","like_count","edge_media_preview_like.count")
-          comm =col("commentsCount","comments","comment_count")
+          typec=col("type","productType","media_type"); capc=col("caption","caption_v4","caption_v3")
+          like=col("likesCount","likes","like_count","edge_media_preview_like.count")
+          comm=col("commentsCount","comments","comment_count")
           views=col("videoViewCount","video_views","playCount","videoPlayCount")
-          disp =col("displayUrl","imageUrl","thumbnailUrl","display_url")
-          vid  =col("videoUrl","video_url")
-
+          disp=col("displayUrl","imageUrl","thumbnailUrl","display_url")
+          vid=col("videoUrl","video_url")
           rows=[]
           for scode, grp in df.groupby("_sc"):
-              row={
-                "shortCode": scode,
-                "postUrl": first(grp,"_postUrl"),
-                "caption": first(grp, capc) if capc else "",
-                "type":    first(grp, typec) if typec else "",
-                "likesCount": first(grp, like) if like else "",
-                "commentsCount": first(grp, comm) if comm else "",
-                "displayUrl": first(grp, disp) if disp else "",
-                "videoUrl":   first(grp, vid)  if vid  else "",
-                "date_v4": first(grp, "date_v4"),
-                "__dt": grp["_dt"].max(),
-              }
+              row={"shortCode":scode,"postUrl":first(grp,"_postUrl"),"caption":first(grp,capc),"type":first(grp,typec),
+                   "likesCount":first(grp,like),"commentsCount":first(grp,comm),
+                   "displayUrl":first(grp,disp),"videoUrl":first(grp,vid),
+                   "date_v4":first(grp,"date_v4"),"__dt":grp["_dt"].max()}
               if views and views in grp.columns:
-                  try:
-                      vv=pd.to_numeric(grp[views].replace("",np.nan),errors="coerce").max()
-                      row["views"]= "" if pd.isna(vv) else str(int(vv))
-                  except: row["views"]= first(grp, views)
-              else:
-                  row["views"]=""
+                  try: vv=pd.to_numeric(grp[views].replace("",np.nan),errors="coerce").max(); row["views"]= "" if pd.isna(vv) else str(int(vv))
+                  except: row["views"]=first(grp,views)
+              else: row["views"]=""
               rows.append(row)
-
           out=pd.DataFrame(rows).sort_values("__dt",ascending=False).reset_index(drop=True)
           out=out[["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]]
-          out.to_csv(dst,index=False)
-          print("Weekly rows:", len(out))
+          out.to_csv(dst,index=False); print("Weekly rows:", len(out))
           PY
 
-      # 3) Diagnostics: what we have / missing before downloads
-      - name: Media diagnostics (before download)
+      # 3) Diagnostics (pre-download)
+      - name: Media diagnostics (before)
         run: |
           python - <<'PY'
           import pandas as pd
           df=pd.read_csv("pipeline/latest_posts.csv")
-          print("Weekly rows:", len(df))
-          has_vidurl = df["videoUrl"].astype(str).str.startswith("http").sum() if "videoUrl" in df else 0
-          has_disp   = df["displayUrl"].astype(str).str.startswith("http").sum() if "displayUrl" in df else 0
-          print(f"Rows with videoUrl: {has_vidurl} / {len(df)}")
-          print(f"Rows with displayUrl: {has_disp} / {len(df)}")
+          v = df["videoUrl"].astype(str).str.startswith("http").sum() if "videoUrl" in df else 0
+          d = df["displayUrl"].astype(str).str.startswith("http").sum() if "displayUrl" in df else 0
+          print(f"Weekly rows: {len(df)} | with videoUrl: {v} | with displayUrl: {d}")
           df.to_csv("pipeline/diagnostics_latest.csv", index=False)
           PY
 
-      # 4) Download videos (with cookies) OR fallback to displayUrl thumbnail per post
-      - name: Download media (video first, else thumbnail)
+      # 4) Download videos (cookies) or fallback displayUrl image for each post
+      - name: Download media (video first, fallback image)
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
           IG_DS_USER_ID:  ${{ secrets.IG_DS_USER_ID }}
@@ -204,55 +164,37 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import os, time, subprocess, pandas as pd, requests
-
           os.makedirs("media_video", exist_ok=True)
           os.makedirs("media_fallback", exist_ok=True)
-
           df=pd.read_csv("pipeline/latest_posts.csv")
-
-          # build cookie header
           parts=[]
           import os as _os
-          for name,envk in [("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
-                            ("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]:
+          for name,envk in [("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]:
             v=_os.environ.get(envk,"").strip()
             if v: parts.append(f"{name}={v}")
-          COOKIE="; ".join(parts)
-          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
-          REF="https://www.instagram.com/"
-
-          s=requests.Session()
-          s.headers.update({"User-Agent":UA,"Referer":REF})
+          COOKIE="; ".join(parts); UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"; REF="https://www.instagram.com/"
+          s=requests.Session(); s.headers.update({"User-Agent":UA,"Referer":REF}); 
           if COOKIE: s.headers.update({"Cookie":COOKIE})
-
-          def direct_video(sc, vu):
+          def direct(sc, vu):
             try:
               with s.get(vu, stream=True, timeout=45) as r:
-                ct=(r.headers.get("Content-Type") or "").lower()
-                if r.status_code==200 and "video/mp4" in ct:
+                if r.status_code==200 and "video/mp4" in (r.headers.get("Content-Type","").lower()):
                   out=f"media_video/{sc}.mp4"
                   with open(out,"wb") as f:
                     for ch in r.iter_content(8192):
                       if ch: f.write(ch)
-                  print("Direct video saved:", out)
-                  return True
-            except Exception as e:
-              print("Direct video failed:", sc, e)
+                  print("Direct video:", out); return True
+            except Exception as e: print("Direct failed", sc, e)
             return False
-
-          def ytdlp_video(sc, post_url):
-            base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
-                  "--no-keep-video","--no-keep-fragments","--no-warnings",
-                  "-o", f"media_video/{sc}.%(ext)s",
-                  "--add-header", f"User-Agent:{UA}",
-                  "--add-header", f"Referer:{REF}"]
+          def ytdlp(sc, pu):
+            base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4","--no-keep-video","--no-keep-fragments","--no-warnings",
+                  "-o", f"media_video/{sc}.%(ext)s","--add-header", f"User-Agent:{UA}","--add-header", f"Referer:{REF}"]
             if COOKIE: base+=["--add-header", f"Cookie:{COOKIE}"]
-            rc=subprocess.run(base+[post_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            rc=subprocess.run(base+[pu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
             ok = (rc==0 and os.path.exists(f"media_video/{sc}.mp4"))
-            if ok: print("yt-dlp video saved:", f"media_video/{sc}.mp4")
+            if ok: print("yt-dlp video:", f"media_video/{sc}.mp4")
             return ok
-
-          def fallback_image(sc, du):
+          def fallback(sc, du):
             try:
               with s.get(du, stream=True, timeout=45) as r:
                 ct=(r.headers.get("Content-Type") or "").lower()
@@ -262,93 +204,198 @@ jobs:
                   with open(out,"wb") as f:
                     for ch in r.iter_content(8192):
                       if ch: f.write(ch)
-                  print("Fallback image saved:", out)
-                  return True
-            except Exception as e:
-              print("Fallback image failed:", sc, e)
+                  print("Fallback image:", out); return True
+            except Exception as e: print("Fallback failed", sc, e)
             return False
-
-          # iterate every weekly post
           for _,r in df.iterrows():
-            sc=str(r.get("shortCode") or "").strip()
+            sc=str(r.get("shortCode") or "").strip(); 
             if not sc: continue
-            vu=str(r.get("videoUrl") or "")
-            pu=str(r.get("postUrl") or "")
-            du=str(r.get("displayUrl") or "")
-
-            got=False
-            if vu.startswith("http"):
-              got = direct_video(sc, vu)
-            if not got and pu.startswith("http"):
+            vu=str(r.get("videoUrl") or ""); pu=str(r.get("postUrl") or ""); du=str(r.get("displayUrl") or "")
+            ok=False
+            if vu.startswith("http"): ok=direct(sc, vu)
+            if not ok and pu.startswith("http"):
               for _ in range(3):
-                if ytdlp_video(sc, pu): got=True; break
+                if ytdlp(sc, pu): ok=True; break
                 time.sleep(2)
-            if not got and du.startswith("http"):
-              fallback_image(sc, du)
-
-          # remove non-mp4 leftovers from media_video
+            if not ok and du.startswith("http"): fallback(sc, du)
           for f in list(os.listdir("media_video")):
             if not f.endswith(".mp4"):
               try: os.remove(os.path.join("media_video",f))
               except: pass
           PY
 
-      # 5) Extract 10 frames from each MP4
-      - name: Extract frames (10 per video)
+      # 5) Extract 10 frames per MP4
+      - name: Extract frames (10/frame)
         run: |
           set -euo pipefail
           python - <<'PY'
           import os, subprocess, glob
-
           os.makedirs("frames_video", exist_ok=True)
           vids=sorted(glob.glob("media_video/*.mp4"))
-          if not vids:
-            print("No videos to frame-extract."); raise SystemExit(0)
-
-          def dur(path):
+          if not vids: print("No videos to frame-extract."); raise SystemExit(0)
+          def dur(p):
             try:
-              out=subprocess.check_output(
-                ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
-              ).decode().strip()
+              out=subprocess.check_output(["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",p]).decode().strip()
               return float(out) if out else None
             except: return None
-
           for vid in vids:
             sc=os.path.splitext(os.path.basename(vid))[0]
-            target=os.path.join("frames_video", sc)
-            os.makedirs(target, exist_ok=True)
+            tgt=os.path.join("frames_video",sc); os.makedirs(tgt,exist_ok=True)
             d=dur(vid)
-            if not d or d<=0:
-              print("No duration for", vid); continue
+            if not d or d<=0: print("No duration for", vid); continue
             stamps=[(i+1)*d/11 for i in range(10)]
             for i,t in enumerate(stamps,1):
-              out=os.path.join(target, f"frame_{i:02d}.jpg")
-              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              out=os.path.join(tgt,f"frame_{i:02d}.jpg")
+              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid","-frames:v","1","-q:v","2",out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               print("Saved", out)
           PY
 
-      # 6) Final diagnostics: what we actually produced this run
-      - name: Media diagnostics (after download)
+      # 6) Diagnostics (post-download)
+      - name: Media diagnostics (after)
         run: |
           python - <<'PY'
           import os, glob, pandas as pd
           df=pd.read_csv("pipeline/latest_posts.csv")
-          ok_vids = len(glob.glob("media_video/*.mp4"))
-          ok_sets = sum(os.path.isdir(p) and len(glob.glob(p+"/*.jpg"))>=10 for p in glob.glob("frames_video/*"))
-          ok_imgs = len(glob.glob("media_fallback/*"))
-          print("SUMMARY")
-          print("  Weekly posts:", len(df))
-          print("  Videos saved:", ok_vids)
-          print("  Frame sets (>=10):", ok_sets)
-          print("  Fallback images:", ok_imgs)
+          ok_vids=len(glob.glob("media_video/*.mp4"))
+          ok_sets=sum(os.path.isdir(p) and len(glob.glob(p+"/*.jpg"))>=10 for p in glob.glob("frames_video/*"))
+          ok_imgs=len(glob.glob("media_fallback/*"))
+          print("SUMMARY -> posts:",len(df)," | videos:",ok_vids," | frame-sets:",ok_sets," | fallbacks:",ok_imgs)
           PY
 
-      # 7) Upload artifacts
+      # 7) OpenAI: Motif+Intent+Territory (frames OR fallback image), merge back
+      - name: Classify motifs + caption intent + territory (OpenAI)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, base64, glob, json, re, pandas as pd, httpx
+          from tenacity import retry, stop_after_attempt, wait_exponential
+          from openai import OpenAI
+          http_client=httpx.Client(trust_env=False, timeout=90)
+          client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"), http_client=http_client)
+          posts=pd.read_csv("pipeline/latest_posts.csv")
+          def enc_img(p):
+            with open(p,"rb") as f: b=base64.b64encode(f.read()).decode("utf-8")
+            return {"type":"input_image","image_url":{"url":f"data:image/jpeg;base64,{b}"}}
+          MOTIF_SYS="You classify ONE visual motif: Product Macro; Lifestyle / Environment; Crowd POV; Creator POV. Return ONLY JSON: {\"motif\":\"<label>\",\"confidence\":0-1}."
+          TERR_SYS=("Classify ONE territory + ONE caption intent. Territories: Football / Messi Baseline; Future Clarity; Performance Mastery; Creative Momentum. "
+                    "Intents: Participation / Prompt; Focus / Discipline; Product / Availability; Celebration / Moment. Return ONLY JSON: {\"territory\":\"<one>\",\"intent\":\"<one>\"}.")
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
+          def classify_motif(images):
+            content=[{"type":"input_text","text":MOTIF_SYS}] + [enc_img(p) for p in images]
+            resp=client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":content}], temperature=0)
+            return resp.choices[0].message.content.strip()
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
+          def classify_text(caption, hint):
+            prompt=f"{TERR_SYS}\nMotif hint: {hint}\nCaption: {caption}"
+            resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], temperature=0)
+            return resp.choices[0].message.content.strip()
+          out=[]
+          for _,r in posts.iterrows():
+            sc=str(r.get("shortCode") or "")
+            frames=sorted(glob.glob(os.path.join("frames_video",sc,"frame_*.jpg")))
+            if not frames:
+              fb=glob.glob(os.path.join("media_fallback", f"{sc}.*"))
+              frames=[fb[0]] if fb else []
+            motif_json='{"motif":"Lifestyle / Environment","confidence":0.5}'
+            if frames:
+              picks=[frames[0], frames[len(frames)//2], frames[-1]] if len(frames)>=3 else [frames[0]]
+              try: motif_json=classify_motif(picks)
+              except Exception as e: print("motif error", sc, e)
+            try:
+              mj=json.loads(motif_json); 
+              if isinstance(mj,str): mj=json.loads(mj)
+              motif=mj.get("motif","Lifestyle / Environment"); conf=float(mj.get("confidence",0.5))
+            except Exception:
+              m=re.search(r'"motif"\s*:\s*"([^"]+)"', motif_json); motif=m.group(1) if m else "Lifestyle / Environment"; conf=0.5
+            terr="Future Clarity"; intent="Celebration / Moment"
+            try:
+              tj=classify_text(r.get("caption",""), motif)
+              tj=json.loads(tj) if isinstance(tj,str) else tj
+              if isinstance(tj,str): tj=json.loads(tj)
+              terr=tj.get("territory",terr); intent=tj.get("intent",intent)
+            except Exception as e:
+              print("text classify error", sc, e)
+            out.append({"shortCode":sc,"Motif_v1":motif,"Motif_conf":conf,"Caption_Intent_v1":intent,"Assigned_Territory_v4":terr})
+          add=pd.DataFrame(out)
+          merged=posts.merge(add,on="shortCode",how="left")
+          merged.to_csv("pipeline/latest_posts.csv",index=False)
+          print("Merged into latest_posts.csv with motif/intent/territory.")
+          PY
+
+      # 8) Notion (URL→Rich-text fallback for Linked Post(s))
+      - name: Publish weekly visual narrative to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, json, pandas as pd, requests
+          from datetime import datetime, timezone
+          TOK=os.environ["NOTION_TOKEN"]; DB=os.environ["NOTION_DB_MASPLUS"]
+          H={"Authorization":f"Bearer {TOK}","Notion-Version":"2022-06-28","Content-Type":"application/json"}
+          def rt(x):  return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
+          def ttl(x): return {"title":[{"type":"text","text":{"content":str(x)[:200]}}]}
+          def sel(x): return {"select":{"name":x}}
+          def msel(tags): return {"multi_select":[{"name":t[:100]} for t in tags if t]}
+          posts=pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
+          week=datetime.now(timezone.utc).strftime("%Y-%m-%d"); n=len(posts)
+          motif_counts=posts.get("Motif_v1",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+          terr_counts =posts.get("Assigned_Territory_v4",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+          motif_line=" • ".join([f"{k}: {v}" for k,v in motif_counts.items()]) if motif_counts else "No motifs"
+          terr_line =" • ".join([f"{k}: {v}" for k,v in terr_counts.items()])  if terr_counts  else "No territories"
+          metric=f"Posts: {n} | Motifs: {motif_line} | Territories: {terr_line}"
+          avg_conf=float(posts.get("Motif_conf",pd.Series([0.5]*n)).mean()) if n else 0.5
+          conf="High" if avg_conf>=0.75 else ("Medium" if avg_conf>=0.5 else "Low")
+          motifs=[m for m in posts.get("Motif_v1",[]) if isinstance(m,str)]
+          intents=[i for i in posts.get("Caption_Intent_v1",[]) if isinstance(i,str)]
+          drivers=sorted(set(motifs+intents))
+          def row_line(r): return f"{r.get('date_v4','?')} · {r.get('shortCode','?')} · {r.get('postUrl','')}"
+          linked_list="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
+          first_url=""
+          if n:
+            for _,r in posts.iterrows():
+              u=str(r.get("postUrl","") or "")
+              if u.startswith("http"): first_url=u; break
+          # stronger recommendation
+          top_motif=max(motif_counts,key=motif_counts.get) if motif_counts else None
+          top_terr=max(terr_counts,key=terr_counts.get) if terr_counts else None
+          rec="Anchor performance-led posts with consistent Product Macro follow-ups."
+          if top_motif=="Crowd POV": rec="Follow crowd peaks with Macro/Creator POV within 24h to convert reach to depth."
+          elif top_motif=="Product Macro": rec="Sustain Macro cadence; interleave Creator POV to humanise routine."
+          elif top_motif=="Creator POV": rec="Scale creator-led short edits; validate with Macro bookends."
+          if top_terr: rec+=f" Territory strongest: {top_terr}."
+          coverage=min(1.0,n/10.0); impact=round(coverage*avg_conf*100)
+          dbg="\n".join([f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()]) if n else ""
+          payload_url={"parent":{"database_id":DB},"properties":{
+            "Date":{"date":{"start":week}},
+            "Insight Type":sel("Weekly Motifs"),
+            "Title":ttl("Weekly Motifs & Territories"),
+            "Headline":rt(f"Weekly Motifs & Territories — {week}"),
+            "Metric":rt(metric),
+            "Confidence":sel(conf),
+            "Driver Tags":msel(drivers),
+            "Linked Post(s)":{"url": first_url},
+            "Action":rt(rec),
+            "Impact Score":{"number":impact},
+            "Debug Confidence":rt(dbg),
+            "Status":sel("Published")
+          }}
+          r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_url))
+          if r.status_code==400 and "expected to be url" in r.text.lower():
+            props=payload_url["properties"].copy(); props["Linked Post(s)"]=rt(linked_list)
+            payload_rt={"parent":{"database_id":DB},"properties":props}
+            r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_rt))
+          print("Notion:", r.status_code, r.text[:300])
+          PY
+
+      # 9) Upload artifacts
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: weekly_media_diagnostics
+          name: weekly_full_bundle
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
