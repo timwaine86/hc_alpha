@@ -366,7 +366,7 @@ jobs:
           print("Merged into latest_posts.csv")
           PY
 
-      # 5) Notion: all requested properties (Linked Post(s) fixed)
+      # 5) Notion (with Linked Post(s) URL→Rich-text fallback)
       - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -404,27 +404,17 @@ jobs:
           driver_tags=sorted(set(motifs+intents))
 
           def row_line(r): return f"{r.get('date_v4','?')} · {r.get('shortCode','?')} · {r.get('postUrl','')}"
-          linked_posts="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
+          linked_posts_list="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
 
-          top_motif=max(motif_counts,key=motif_counts.get) if motif_counts else None
-          top_terr =max(terr_counts, key=terr_counts.get)  if terr_counts  else None
-          if top_motif=="Crowd POV":
-            action_text="Follow crowd-led posts with a Product Macro within 24h to carry meaning."
-          elif top_motif=="Product Macro":
-            action_text="Keep macro cadence; pair with Creator POV to humanise routine."
-          elif top_motif=="Creator POV":
-            action_text="Use creator-led short cuts to bridge hype → habit."
-          else:
-            action_text="Balance reach (Crowd/Creative Momentum) with depth (Macro/Performance)."
-          if top_terr:
-            action_text+=f" Territory signal strongest in: {top_terr}."
+          first_url=""
+          if n:
+            for _,r in posts.iterrows():
+              u=str(r.get("postUrl","") or "")
+              if u.startswith("http"):
+                first_url=u
+                break
 
-          coverage=min(1.0, n/10.0)
-          impact_score=round((coverage*avg_conf)*100)
-
-          dbg="\n".join([f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()]) if n else ""
-
-          payload={
+          payload_url={
             "parent":{"database_id":DB_ID},
             "properties":{
               "Date":{"date":{"start":week}},
@@ -434,10 +424,10 @@ jobs:
               "Metric":rt(metric_text),
               "Confidence":sel(conf_band),
               "Driver Tags":msel(driver_tags),
-              "Linked Post(s)":rt(linked_posts),   # <-- fixed property name
-              "Action":rt(action_text),
-              "Impact Score":{"number":impact_score},
-              "Debug Confidence":rt(dbg),
+              "Linked Post(s)":{"url": first_url},
+              "Action":rt("Balance reach (Crowd/Creative Momentum) with depth (Macro/Performance)."),
+              "Impact Score":{"number":round(min(1.0, n/10.0)*avg_conf*100)},
+              "Debug Confidence":rt("\n".join([f\"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}\" for _,r in posts.iterrows()]) if n else ""),
               "Status":sel("Published")
             },
             "children":[
@@ -446,7 +436,13 @@ jobs:
             ]
           }
 
-          r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
+          r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_url))
+          if r.status_code==400 and "expected to be url" in r.text.lower():
+            props_rt = payload_url["properties"].copy()
+            props_rt["Linked Post(s)"] = {"rich_text":[{"type":"text","text":{"content":linked_posts_list[:1900]}}]}
+            payload_rt = {"parent":{"database_id":DB_ID},"properties":props_rt,"children":payload_url["children"]}
+            r = requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_rt))
+
           print("Notion:", r.status_code, r.text[:300])
           PY
 
