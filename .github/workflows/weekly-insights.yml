@@ -33,9 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      # -----------------------------
       # 1) Fetch from Apify (async)
-      # -----------------------------
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -86,9 +84,7 @@ jobs:
           fi
           head -5 "${OUT_RAW}"
 
-      # --------------------------------------------
-      # 2) Normalize -> last 7 days, tidy columns
-      # --------------------------------------------
+      # 2) Normalize -> last 7 days
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -190,9 +186,7 @@ jobs:
           print("Weekly rows:", len(clean))
           PY
 
-      # ----------------------------------------------------
-      # 3) Videos -> <shortCode>.mp4 ; frames -> per post
-      # ----------------------------------------------------
+      # 3) Download videos and extract frames
       - name: Download IG videos and extract 10 frames each
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
@@ -227,7 +221,7 @@ jobs:
 
           downloaded=[]
 
-          # try direct CDN first
+          # direct CDN first
           for _,r in df.iterrows():
             sc=str(r["shortCode"]); vu=str(r.get("videoUrl","") or "")
             if not sc or not vu: continue
@@ -295,9 +289,7 @@ jobs:
               print("Saved", out)
           PY
 
-      # --------------------------------------------------------------
-      # 4) OpenAI: Motif (Vision) + Caption Intent + Territory -> CSV
-      # --------------------------------------------------------------
+      # 4) OpenAI: motif + caption intent + territory -> merge back
       - name: Classify motifs + caption intent + territory (OpenAI)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -374,10 +366,8 @@ jobs:
           print("Merged into latest_posts.csv")
           PY
 
-      # -------------------------------------------------------
-      # 5) Notion: populate all requested properties on a page
-      # -------------------------------------------------------
-            - name: Publish weekly visual narrative to Notion
+      # 5) Notion: all requested properties (Linked Post(s) fixed)
+      - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
@@ -444,7 +434,7 @@ jobs:
               "Metric":rt(metric_text),
               "Confidence":sel(conf_band),
               "Driver Tags":msel(driver_tags),
-              "Linked Post(s)":rt(linked_posts),   # <-- changed key here
+              "Linked Post(s)":rt(linked_posts),   # <-- fixed property name
               "Action":rt(action_text),
               "Impact Score":{"number":impact_score},
               "Debug Confidence":rt(dbg),
@@ -459,10 +449,8 @@ jobs:
           r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
           print("Notion:", r.status_code, r.text[:300])
           PY
-          
-      # -----------------------
+
       # 6) Upload artifacts
-      # -----------------------
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
