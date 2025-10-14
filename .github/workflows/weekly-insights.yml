@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
 
 permissions:
   contents: read
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -28,12 +28,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas python-dateutil python-dotenv requests numpy tenacity openai==1.51.2
+          pip install pandas python-dateutil python-dotenv requests numpy
           pip install yt-dlp
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      # 1) Fetch from Apify (async)
+      # 1) Fetch (async) -> raw CSV
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -72,20 +72,17 @@ jobs:
 
           DATASET_ID=$(printf '%s' "${RESP}" | python -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("data",{}).get("defaultDatasetId",""))')
           if [ -z "${DATASET_ID}" ]; then
-            echo "No dataset id"
-            printf '%s\n' "${RESP}"
-            exit 1
+            echo "No dataset id"; printf '%s\n' "${RESP}"; exit 1
           fi
 
           curl -sS "https://api.apify.com/v2/datasets/${DATASET_ID}/items?format=csv&clean=true&token=${APIFY_TOKEN}" -o "${OUT_RAW}"
           if [ ! -s "${OUT_RAW}" ]; then
-            echo "Empty CSV"
-            exit 1
+            echo "Empty CSV"; exit 1
           fi
           head -5 "${OUT_RAW}"
 
-      # 2) Normalize -> last 7 days
-      - name: Normalize CSV for baseline_check.py
+      # 2) Normalize -> last 7 days, tidy columns
+      - name: Normalize CSV (weekly scope)
         run: |
           python - <<'PY'
           import pandas as pd, numpy as np, re
@@ -99,183 +96,263 @@ jobs:
                   if n and n.lower() in lower: return lower[n.lower()]
               return None
 
-          sc_col=col("shortCode","short_code","shortcode")
-          posturl_col=col("postUrl","url","permalink","link")
-          if not sc_col and posturl_col:
-              def extract_sc(u):
+          sc=col("shortCode","short_code","shortcode")
+          url=col("postUrl","url","permalink","link")
+          if not sc and url:
+              def from_url(u):
                   m=re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)/?", str(u)); return m.group(1) if m else ""
-              df["__sc_from_url"]=df[posturl_col].map(extract_sc); sc_col="__sc_from_url"
+              df["__sc"]=df[url].map(from_url); sc="__sc"
 
-          ts_candidates=["timestamp","takenAt","taken_at","takenAtISO","taken_at_iso","takenAtUtc","taken_at_utc",
-                         "takenAtTimestamp","taken_at_timestamp","created_time","createdAt","published_time","date","time","datetime"]
-          ts_cols=[c for c in (col(x) for x in ts_candidates) if c]
+          ts_names=["timestamp","takenAt","taken_at","takenAtISO","taken_at_iso","takenAtUtc","taken_at_utc",
+                    "takenAtTimestamp","taken_at_timestamp","created_time","createdAt","published_time","date","time","datetime"]
+          ts_cols=[c for c in (col(x) for x in ts_names) if c]
 
-          def parse_ts_row(row):
+          def parse_row(r):
               for c in ts_cols:
-                  val=str(row.get(c,"")).strip()
-                  if not val: continue
-                  dt=pd.to_datetime(val,errors="coerce",utc=True)
+                  v=str(r.get(c,"")).strip()
+                  if not v: continue
+                  dt=pd.to_datetime(v,errors="coerce",utc=True)
                   if pd.notna(dt): return dt
-                  num=pd.to_numeric(val,errors="coerce")
+                  num=pd.to_numeric(v,errors="coerce")
                   if pd.notna(num):
                       for unit in ["s","ms"]:
                           dt=pd.to_datetime(num,unit=unit,errors="coerce",utc=True)
                           if pd.notna(dt): return dt
               return pd.NaT
 
-          df["_sc"]= (df[sc_col] if sc_col else "").astype(str).str.strip()
-          df["_postUrl"]= df[posturl_col] if posturl_col else ""
-          df["_dt"]= df.apply(parse_ts_row,axis=1)
+          df["_sc"]= (df[sc] if sc else "").astype(str).str.strip()
+          df["_postUrl"]= df[url] if url else ""
+          df["_dt"]= df.apply(parse_row,axis=1)
 
-          now = Timestamp.now(tz="UTC"); week_cut = now - Timedelta(days=7)
-          df = df.loc[df["_dt"].notna() & (df["_dt"] >= week_cut)].copy()
+          now=Timestamp.now(tz="UTC"); cut=now-Timedelta(days=7)
+          df=df.loc[df["_dt"].notna() & (df["_dt"]>=cut)].copy()
 
-          parent=df.loc[df["_sc"].ne("")].copy()
-          if parent.empty:
+          if df.empty:
               pd.DataFrame(columns=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]).to_csv(dst,index=False)
               raise SystemExit(0)
 
-          parent["date_v4"]=parent["_dt"].dt.strftime("%Y-%m-%d")
+          df["date_v4"]=df["_dt"].dt.strftime("%Y-%m-%d")
 
-          def first_nonempty(s):
+          def first(grp, colname):
+              s=grp[colname] if colname in grp.columns else None
+              if s is None: return ""
               for v in s:
-                  sv=str(v) if pd.notna(v) else ""
-                  if sv.strip(): return sv
+                  vv=str(v).strip()
+                  if vv: return vv
               return ""
 
-          def colopt(*names):
-              c=col(*names); return c if (c in parent.columns) else None
-
-          type_col=colopt("type","productType","media_type")
-          cap_col =colopt("caption","caption_v4","caption_v3")
-          like_col=colopt("likesCount","likes","like_count","edge_media_preview_like.count")
-          com_col =colopt("commentsCount","comments","comment_count")
-          vvc_col =colopt("videoViewCount","video_views","playCount","videoPlayCount")
-          disp_col=colopt("displayUrl","imageUrl","thumbnailUrl","display_url")
-          vid_col =colopt("videoUrl","video_url")
+          typec=col("type","productType","media_type")
+          capc =col("caption","caption_v4","caption_v3")
+          like =col("likesCount","likes","like_count","edge_media_preview_like.count")
+          comm =col("commentsCount","comments","comment_count")
+          views=col("videoViewCount","video_views","playCount","videoPlayCount")
+          disp =col("displayUrl","imageUrl","thumbnailUrl","display_url")
+          vid  =col("videoUrl","video_url")
 
           rows=[]
-          for sc,grp in parent.groupby("_sc"):
-              row={"shortCode":sc,
-                   "postUrl":first_nonempty(grp["_postUrl"]),
-                   "caption":first_nonempty(grp[cap_col]) if cap_col else "",
-                   "type":first_nonempty(grp[type_col]) if type_col else "",
-                   "likesCount":first_nonempty(grp[like_col]) if like_col else "",
-                   "commentsCount":first_nonempty(grp[com_col]) if com_col else "",
-                   "displayUrl":first_nonempty(grp[disp_col]) if disp_col else "",
-                   "videoUrl":first_nonempty(grp[vid_col]) if vid_col else "",
-                   "date_v4":first_nonempty(grp["date_v4"]),
-                   "__dt":grp["_dt"].max()}
-              if vvc_col:
+          for scode, grp in df.groupby("_sc"):
+              row={
+                "shortCode": scode,
+                "postUrl": first(grp,"_postUrl"),
+                "caption": first(grp, capc) if capc else "",
+                "type":    first(grp, typec) if typec else "",
+                "likesCount": first(grp, like) if like else "",
+                "commentsCount": first(grp, comm) if comm else "",
+                "displayUrl": first(grp, disp) if disp else "",
+                "videoUrl":   first(grp, vid)  if vid  else "",
+                "date_v4": first(grp, "date_v4"),
+                "__dt": grp["_dt"].max(),
+              }
+              if views and views in grp.columns:
                   try:
-                      vv=pd.to_numeric(grp[vvc_col].replace("",np.nan),errors="coerce").max()
+                      vv=pd.to_numeric(grp[views].replace("",np.nan),errors="coerce").max()
                       row["views"]= "" if pd.isna(vv) else str(int(vv))
-                  except: row["views"]=first_nonempty(grp[vvc_col])
-              else: row["views"]=""
+                  except: row["views"]= first(grp, views)
+              else:
+                  row["views"]=""
               rows.append(row)
 
-          clean=pd.DataFrame(rows)
-          clean["__dt"]=pd.to_datetime(clean["__dt"],errors="coerce",utc=True)
-          clean=clean.sort_values("__dt",ascending=False).reset_index(drop=True)
-
-          final_cols=["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]
-          for c in final_cols:
-              if c not in clean.columns: clean[c]=""
-          clean=clean[final_cols]
-          clean.to_csv(dst,index=False)
-          print("Weekly rows:", len(clean))
+          out=pd.DataFrame(rows).sort_values("__dt",ascending=False).reset_index(drop=True)
+          out=out[["date_v4","shortCode","postUrl","type","caption","likesCount","commentsCount","views","displayUrl","videoUrl"]]
+          out.to_csv(dst,index=False)
+          print("Weekly rows:", len(out))
           PY
 
-      # 5) Notion with Linked Post(s) fallback and fixed Debug Confidence
-      - name: Publish weekly visual narrative to Notion
+      # 3) Diagnostics: what we have / missing before downloads
+      - name: Media diagnostics (before download)
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          df=pd.read_csv("pipeline/latest_posts.csv")
+          print("Weekly rows:", len(df))
+          has_vidurl = df["videoUrl"].astype(str).str.startswith("http").sum() if "videoUrl" in df else 0
+          has_disp   = df["displayUrl"].astype(str).str.startswith("http").sum() if "displayUrl" in df else 0
+          print(f"Rows with videoUrl: {has_vidurl} / {len(df)}")
+          print(f"Rows with displayUrl: {has_disp} / {len(df)}")
+          df.to_csv("pipeline/diagnostics_latest.csv", index=False)
+          PY
+
+      # 4) Download videos (with cookies) OR fallback to displayUrl thumbnail per post
+      - name: Download media (video first, else thumbnail)
         env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+          IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
+          IG_DS_USER_ID:  ${{ secrets.IG_DS_USER_ID }}
+          IG_CSRF:        ${{ secrets.IG_CSRF }}
+          IG_RUR:         ${{ secrets.IG_RUR }}
+          IG_MID:         ${{ secrets.IG_MID }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, json, pandas as pd, requests
-          from datetime import datetime, timezone
+          import os, time, subprocess, pandas as pd, requests
 
-          NOTION_TOKEN=os.environ["NOTION_TOKEN"]
-          DB_ID=os.environ["NOTION_DB_MASPLUS"]
-          H={"Authorization":f"Bearer {NOTION_TOKEN}","Notion-Version":"2022-06-28","Content-Type":"application/json"}
+          os.makedirs("media_video", exist_ok=True)
+          os.makedirs("media_fallback", exist_ok=True)
 
-          def rt(x):  return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
-          def ttl(x): return {"title":[{"type":"text","text":{"content":str(x)[:200]}}]}
-          def sel(x): return {"select":{"name":x}}
-          def msel(tags): return {"multi_select":[{"name":t[:100]} for t in tags if t]}
+          df=pd.read_csv("pipeline/latest_posts.csv")
 
-          posts=pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
-          week=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-          n=len(posts)
+          # build cookie header
+          parts=[]
+          import os as _os
+          for name,envk in [("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
+                            ("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]:
+            v=_os.environ.get(envk,"").strip()
+            if v: parts.append(f"{name}={v}")
+          COOKIE="; ".join(parts)
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
+          REF="https://www.instagram.com/"
 
-          motif_counts=posts.get("Motif_v1",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
-          terr_counts =posts.get("Assigned_Territory_v4",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
-          motif_line=" • ".join([f"{k}: {v}" for k,v in motif_counts.items()]) if motif_counts else "No motifs"
-          terr_line =" • ".join([f"{k}: {v}" for k,v in terr_counts.items()])  if terr_counts  else "No territories"
-          metric_text=f"Posts: {n} | Motifs: {motif_line} | Territories: {terr_line}"
+          s=requests.Session()
+          s.headers.update({"User-Agent":UA,"Referer":REF})
+          if COOKIE: s.headers.update({"Cookie":COOKIE})
 
-          avg_conf=float(posts.get("Motif_conf",pd.Series([0.5]*n)).mean()) if n else 0.5
-          conf_band="High" if avg_conf>=0.75 else ("Medium" if avg_conf>=0.5 else "Low")
+          def direct_video(sc, vu):
+            try:
+              with s.get(vu, stream=True, timeout=45) as r:
+                ct=(r.headers.get("Content-Type") or "").lower()
+                if r.status_code==200 and "video/mp4" in ct:
+                  out=f"media_video/{sc}.mp4"
+                  with open(out,"wb") as f:
+                    for ch in r.iter_content(8192):
+                      if ch: f.write(ch)
+                  print("Direct video saved:", out)
+                  return True
+            except Exception as e:
+              print("Direct video failed:", sc, e)
+            return False
 
-          motifs=[m for m in posts.get("Motif_v1",[]) if isinstance(m,str)]
-          intents=[i for i in posts.get("Caption_Intent_v1",[]) if isinstance(i,str)]
-          driver_tags=sorted(set(motifs+intents))
+          def ytdlp_video(sc, post_url):
+            base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
+                  "--no-keep-video","--no-keep-fragments","--no-warnings",
+                  "-o", f"media_video/{sc}.%(ext)s",
+                  "--add-header", f"User-Agent:{UA}",
+                  "--add-header", f"Referer:{REF}"]
+            if COOKIE: base+=["--add-header", f"Cookie:{COOKIE}"]
+            rc=subprocess.run(base+[post_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            ok = (rc==0 and os.path.exists(f"media_video/{sc}.mp4"))
+            if ok: print("yt-dlp video saved:", f"media_video/{sc}.mp4")
+            return ok
 
-          def row_line(r): return f"{r.get('date_v4','?')} · {r.get('shortCode','?')} · {r.get('postUrl','')}"
-          linked_posts_list="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
+          def fallback_image(sc, du):
+            try:
+              with s.get(du, stream=True, timeout=45) as r:
+                ct=(r.headers.get("Content-Type") or "").lower()
+                if r.status_code==200 and ("image/jpeg" in ct or "image/jpg" in ct or "image/png" in ct):
+                  ext=".jpg" if "jpeg" in ct or "jpg" in ct else ".png"
+                  out=f"media_fallback/{sc}{ext}"
+                  with open(out,"wb") as f:
+                    for ch in r.iter_content(8192):
+                      if ch: f.write(ch)
+                  print("Fallback image saved:", out)
+                  return True
+            except Exception as e:
+              print("Fallback image failed:", sc, e)
+            return False
 
-          first_url=""
-          if n:
-            for _,r in posts.iterrows():
-              u=str(r.get("postUrl","") or "")
-              if u.startswith("http"):
-                first_url=u
-                break
+          # iterate every weekly post
+          for _,r in df.iterrows():
+            sc=str(r.get("shortCode") or "").strip()
+            if not sc: continue
+            vu=str(r.get("videoUrl") or "")
+            pu=str(r.get("postUrl") or "")
+            du=str(r.get("displayUrl") or "")
 
-          # debug confidence safe join
-          dbg_list=[f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()] if n else []
-          dbg_str="\n".join(dbg_list)
+            got=False
+            if vu.startswith("http"):
+              got = direct_video(sc, vu)
+            if not got and pu.startswith("http"):
+              for _ in range(3):
+                if ytdlp_video(sc, pu): got=True; break
+                time.sleep(2)
+            if not got and du.startswith("http"):
+              fallback_image(sc, du)
 
-          payload_url={
-            "parent":{"database_id":DB_ID},
-            "properties":{
-              "Date":{"date":{"start":week}},
-              "Insight Type":sel("Weekly Motifs"),
-              "Title":ttl("Weekly Motifs & Territories"),
-              "Headline":rt(f"Weekly Motifs & Territories — {week}"),
-              "Metric":rt(metric_text),
-              "Confidence":sel(conf_band),
-              "Driver Tags":msel(driver_tags),
-              "Linked Post(s)":{"url": first_url},
-              "Action":rt("Balance reach (Crowd/Creative Momentum) with depth (Macro/Performance)."),
-              "Impact Score":{"number":round(min(1.0, n/10.0)*avg_conf*100)},
-              "Debug Confidence":rt(dbg_str),
-              "Status":sel("Published")
-            },
-            "children":[
-              {"object":"block","type":"paragraph",
-               "paragraph":{"rich_text":[{"type":"text","text":{"content":metric_text}}]}}
-            ]
-          }
-
-          r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_url))
-          if r.status_code==400 and "expected to be url" in r.text.lower():
-            props_rt = payload_url["properties"].copy()
-            props_rt["Linked Post(s)"] = rt(linked_posts_list)
-            payload_rt = {"parent":{"database_id":DB_ID},"properties":props_rt,"children":payload_url["children"]}
-            r = requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_rt))
-
-          print("Notion:", r.status_code, r.text[:300])
+          # remove non-mp4 leftovers from media_video
+          for f in list(os.listdir("media_video")):
+            if not f.endswith(".mp4"):
+              try: os.remove(os.path.join("media_video",f))
+              except: pass
           PY
 
+      # 5) Extract 10 frames from each MP4
+      - name: Extract frames (10 per video)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, subprocess, glob
+
+          os.makedirs("frames_video", exist_ok=True)
+          vids=sorted(glob.glob("media_video/*.mp4"))
+          if not vids:
+            print("No videos to frame-extract."); raise SystemExit(0)
+
+          def dur(path):
+            try:
+              out=subprocess.check_output(
+                ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
+              ).decode().strip()
+              return float(out) if out else None
+            except: return None
+
+          for vid in vids:
+            sc=os.path.splitext(os.path.basename(vid))[0]
+            target=os.path.join("frames_video", sc)
+            os.makedirs(target, exist_ok=True)
+            d=dur(vid)
+            if not d or d<=0:
+              print("No duration for", vid); continue
+            stamps=[(i+1)*d/11 for i in range(10)]
+            for i,t in enumerate(stamps,1):
+              out=os.path.join(target, f"frame_{i:02d}.jpg")
+              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              print("Saved", out)
+          PY
+
+      # 6) Final diagnostics: what we actually produced this run
+      - name: Media diagnostics (after download)
+        run: |
+          python - <<'PY'
+          import os, glob, pandas as pd
+          df=pd.read_csv("pipeline/latest_posts.csv")
+          ok_vids = len(glob.glob("media_video/*.mp4"))
+          ok_sets = sum(os.path.isdir(p) and len(glob.glob(p+"/*.jpg"))>=10 for p in glob.glob("frames_video/*"))
+          ok_imgs = len(glob.glob("media_fallback/*"))
+          print("SUMMARY")
+          print("  Weekly posts:", len(df))
+          print("  Videos saved:", ok_vids)
+          print("  Frame sets (>=10):", ok_sets)
+          print("  Fallback images:", ok_imgs)
+          PY
+
+      # 7) Upload artifacts
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: weekly_csvs_videos_frames
+          name: weekly_media_diagnostics
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
+            pipeline/diagnostics_latest.csv
             media_video
             frames_video
+            media_fallback
