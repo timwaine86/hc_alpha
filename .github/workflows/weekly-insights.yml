@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -186,187 +186,7 @@ jobs:
           print("Weekly rows:", len(clean))
           PY
 
-      # 3) Download videos and extract frames
-      - name: Download IG videos and extract 10 frames each
-        env:
-          IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
-          IG_DS_USER_ID:  ${{ secrets.IG_DS_USER_ID }}
-          IG_CSRF:        ${{ secrets.IG_CSRF }}
-          IG_RUR:         ${{ secrets.IG_RUR }}
-          IG_MID:         ${{ secrets.IG_MID }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os, time, subprocess, pandas as pd, requests
-
-          os.makedirs("media_video", exist_ok=True)
-          os.makedirs("frames_video", exist_ok=True)
-
-          df=pd.read_csv("pipeline/latest_posts.csv")
-
-          cookie_names=[("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
-                        ("csrftoken","IG_CSRF"),("rur","IG_RUR"),("mid","IG_MID")]
-          parts=[]
-          import os as _os
-          for name,envk in cookie_names:
-            val=_os.environ.get(envk,"").strip()
-            if val: parts.append(f"{name}={val}")
-          COOKIE="; ".join(parts)
-          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36"
-          REF="https://www.instagram.com/"
-
-          s=requests.Session()
-          s.headers.update({"User-Agent":UA,"Referer":REF})
-          if COOKIE: s.headers.update({"Cookie":COOKIE})
-
-          downloaded=[]
-
-          # direct CDN first
-          for _,r in df.iterrows():
-            sc=str(r["shortCode"]); vu=str(r.get("videoUrl","") or "")
-            if not sc or not vu: continue
-            out=f"media_video/{sc}.mp4"
-            if os.path.exists(out): downloaded.append(out); continue
-            try:
-              with s.get(vu, stream=True, timeout=45) as resp:
-                ct=(resp.headers.get("Content-Type") or "").lower()
-                if resp.status_code==200 and "video/mp4" in ct:
-                  with open(out,"wb") as f:
-                    for chunk in resp.iter_content(8192):
-                      if chunk: f.write(chunk)
-                  print("Direct saved:", out); downloaded.append(out)
-            except Exception as e:
-              print("Direct failed for", sc, e)
-
-          # yt-dlp fallback (3 tries per post)
-          def ytdlp(sc,url):
-            base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
-                  "--no-keep-video","--no-keep-fragments","--no-warnings",
-                  "-o", f"media_video/{sc}.%(ext)s",
-                  "--add-header", f"User-Agent:{UA}",
-                  "--add-header", f"Referer:{REF}"]
-            if COOKIE: base+=["--add-header", f"Cookie:{COOKIE}"]
-            rc=subprocess.run(base+[url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-            return rc==0 and os.path.exists(f"media_video/{sc}.mp4")
-
-          for _,r in df.iterrows():
-            sc=str(r["shortCode"]); url=str(r.get("postUrl","") or "")
-            if not sc or not url: continue
-            if os.path.exists(f"media_video/{sc}.mp4"): continue
-            for _ in range(3):
-              if ytdlp(sc,url):
-                downloaded.append(f"media_video/{sc}.mp4"); break
-              time.sleep(2)
-
-          # clean non-mp4
-          for f in list(os.listdir("media_video")):
-            if not f.endswith(".mp4"):
-              try: os.remove(os.path.join("media_video",f))
-              except: pass
-
-          if not downloaded:
-            print("No videos saved; skipping frames."); raise SystemExit(0)
-
-          # extract frames
-          def dur(path):
-            try:
-              out=subprocess.check_output(
-                ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=duration","-of","default=nw=1:nk=1",path]
-              ).decode().strip()
-              return float(out) if out else None
-            except: return None
-
-          for vid in downloaded:
-            sc=os.path.splitext(os.path.basename(vid))[0]
-            d=dur(vid)
-            if not d or d<=0: print("No duration for", vid); continue
-            tgt=os.path.join("frames_video",sc); os.makedirs(tgt,exist_ok=True)
-            stamps=[(i+1)*d/11 for i in range(10)]
-            for i,t in enumerate(stamps,1):
-              out=os.path.join(tgt,f"frame_{i:02d}.jpg")
-              subprocess.run(["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-              print("Saved", out)
-          PY
-
-      # 4) OpenAI: motif + caption intent + territory -> merge back
-      - name: Classify motifs + caption intent + territory (OpenAI)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os, base64, glob, json, re, pandas as pd, httpx
-          from tenacity import retry, stop_after_attempt, wait_exponential
-          from openai import OpenAI
-
-          http_client = httpx.Client(trust_env=False, timeout=60)
-          client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), http_client=http_client)
-
-          posts = pd.read_csv("pipeline/latest_posts.csv")
-
-          MOTIF_SYSTEM = """You classify social video frames into ONE visual motif:
-          1) Product Macro — close-up product/bottle, clean framing.
-          2) Lifestyle / Environment — everyday routine scenes (desk, commute, gym bag).
-          3) Crowd POV — crowds, event/stadium energy, spectacle.
-          4) Creator POV — handheld/interview/training/prep.
-          Return ONLY JSON: {"motif":"<label>","confidence":0-1,"reason":"<12 words>"}."""
-
-          def enc_img(path):
-            with open(path,"rb") as f:
-              b64=base64.b64encode(f.read()).decode("utf-8")
-            return {"type":"input_image","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
-
-          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
-          def classify_motif(frames):
-            content=[{"type":"input_text","text":MOTIF_SYSTEM}]
-            if frames:
-              idxs=[0, max(0,len(frames)//4), len(frames)//2, min(len(frames)-1, 3*len(frames)//4), len(frames)-1]
-              for i in sorted(set(idxs)): content.append(enc_img(frames[i]))
-            resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":content}], temperature=0)
-            return resp.choices[0].message.content.strip()
-
-          TERRITORY_DEFS = """Classify a MAS+ Instagram post into ONE territory and ONE intent.
-          Territories: Football / Messi Baseline; Future Clarity; Performance Mastery; Creative Momentum.
-          Intents: Participation / Prompt; Focus / Discipline; Product / Availability; Celebration / Moment.
-          Return ONLY JSON: {"territory":"<one>","intent":"<one>"}."""
-
-          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
-          def classify_text(caption, motif_hint):
-            prompt=f"{TERRITORY_DEFS}\nMotif hint: {motif_hint}\nCaption: {caption}"
-            resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], temperature=0)
-            return resp.choices[0].message.content.strip()
-
-          rows=[]
-          for _, r in posts.iterrows():
-            sc=str(r.get("shortCode") or "")
-            frames=sorted(glob.glob(os.path.join("frames_video",sc,"frame_*.jpg")))
-            motif_json='{"motif":"Lifestyle / Environment","confidence":0.5,"reason":"no frames"}'
-            if frames:
-              try: motif_json=classify_motif(frames)
-              except Exception as e: print("motif error", sc, e)
-            try:
-              mj=json.loads(motif_json); 
-              if isinstance(mj,str): mj=json.loads(mj)
-              motif_label=mj.get("motif","Lifestyle / Environment"); motif_conf=mj.get("confidence",0.5)
-            except Exception:
-              m=re.search(r'"motif"\s*:\s*"([^"]+)"', motif_json); motif_label=m.group(1) if m else "Lifestyle / Environment"; motif_conf=0.5
-            try:
-              text_json=classify_text(r.get("caption",""), motif_label)
-              tj=json.loads(text_json); 
-              if isinstance(tj,str): tj=json.loads(tj)
-              terr=tj.get("territory","Future Clarity"); intent=tj.get("intent","Celebration / Moment")
-            except Exception:
-              terr="Future Clarity"; intent="Celebration / Moment"
-            rows.append({"shortCode":sc,"Motif_v1":motif_label,"Motif_conf":motif_conf,"Caption_Intent_v1":intent,"Assigned_Territory_v4":terr})
-
-          add=pd.DataFrame(rows)
-          merged=posts.merge(add, on="shortCode", how="left")
-          merged.to_csv("pipeline/latest_posts.csv", index=False)
-          print("Merged into latest_posts.csv")
-          PY
-
-      # 5) Notion (with Linked Post(s) URL→Rich-text fallback)
+      # 5) Notion with Linked Post(s) fallback and fixed Debug Confidence
       - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -414,6 +234,10 @@ jobs:
                 first_url=u
                 break
 
+          # debug confidence safe join
+          dbg_list=[f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()] if n else []
+          dbg_str="\n".join(dbg_list)
+
           payload_url={
             "parent":{"database_id":DB_ID},
             "properties":{
@@ -427,7 +251,7 @@ jobs:
               "Linked Post(s)":{"url": first_url},
               "Action":rt("Balance reach (Crowd/Creative Momentum) with depth (Macro/Performance)."),
               "Impact Score":{"number":round(min(1.0, n/10.0)*avg_conf*100)},
-              "Debug Confidence":rt("\n".join([f\"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}\" for _,r in posts.iterrows()]) if n else ""),
+              "Debug Confidence":rt(dbg_str),
               "Status":sel("Published")
             },
             "children":[
@@ -439,14 +263,13 @@ jobs:
           r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_url))
           if r.status_code==400 and "expected to be url" in r.text.lower():
             props_rt = payload_url["properties"].copy()
-            props_rt["Linked Post(s)"] = {"rich_text":[{"type":"text","text":{"content":linked_posts_list[:1900]}}]}
+            props_rt["Linked Post(s)"] = rt(linked_posts_list)
             payload_rt = {"parent":{"database_id":DB_ID},"properties":props_rt,"children":payload_url["children"]}
             r = requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_rt))
 
           print("Notion:", r.status_code, r.text[:300])
           PY
 
-      # 6) Upload artifacts
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
