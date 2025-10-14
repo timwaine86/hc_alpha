@@ -3,7 +3,7 @@ name: weekly-insights
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
 
 permissions:
   contents: read
@@ -33,6 +33,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
+      # -----------------------------
+      # 1) Fetch from Apify (async)
+      # -----------------------------
       - name: Fetch MAS+ data from Apify (async poll)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
@@ -83,6 +86,9 @@ jobs:
           fi
           head -5 "${OUT_RAW}"
 
+      # --------------------------------------------
+      # 2) Normalize -> last 7 days, tidy columns
+      # --------------------------------------------
       - name: Normalize CSV for baseline_check.py
         run: |
           python - <<'PY'
@@ -91,7 +97,6 @@ jobs:
 
           src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
           df=pd.read_csv(src,dtype=str,keep_default_na=False)
-
           lower={c.lower():c for c in df.columns}
           def col(*names):
               for n in names:
@@ -185,6 +190,9 @@ jobs:
           print("Weekly rows:", len(clean))
           PY
 
+      # ----------------------------------------------------
+      # 3) Videos -> <shortCode>.mp4 ; frames -> per post
+      # ----------------------------------------------------
       - name: Download IG videos and extract 10 frames each
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
@@ -219,6 +227,7 @@ jobs:
 
           downloaded=[]
 
+          # try direct CDN first
           for _,r in df.iterrows():
             sc=str(r["shortCode"]); vu=str(r.get("videoUrl","") or "")
             if not sc or not vu: continue
@@ -235,6 +244,7 @@ jobs:
             except Exception as e:
               print("Direct failed for", sc, e)
 
+          # yt-dlp fallback (3 tries per post)
           def ytdlp(sc,url):
             base=["yt-dlp","--no-playlist","-S","ext:mp4:m4a","--merge-output-format","mp4",
                   "--no-keep-video","--no-keep-fragments","--no-warnings",
@@ -254,6 +264,7 @@ jobs:
                 downloaded.append(f"media_video/{sc}.mp4"); break
               time.sleep(2)
 
+          # clean non-mp4
           for f in list(os.listdir("media_video")):
             if not f.endswith(".mp4"):
               try: os.remove(os.path.join("media_video",f))
@@ -262,6 +273,7 @@ jobs:
           if not downloaded:
             print("No videos saved; skipping frames."); raise SystemExit(0)
 
+          # extract frames
           def dur(path):
             try:
               out=subprocess.check_output(
@@ -283,6 +295,9 @@ jobs:
               print("Saved", out)
           PY
 
+      # --------------------------------------------------------------
+      # 4) OpenAI: Motif (Vision) + Caption Intent + Territory -> CSV
+      # --------------------------------------------------------------
       - name: Classify motifs + caption intent + territory (OpenAI)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -359,6 +374,9 @@ jobs:
           print("Merged into latest_posts.csv")
           PY
 
+      # -------------------------------------------------------
+      # 5) Notion: populate all requested properties on a page
+      # -------------------------------------------------------
       - name: Publish weekly visual narrative to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -373,43 +391,78 @@ jobs:
           DB_ID=os.environ["NOTION_DB_MASPLUS"]
           H={"Authorization":f"Bearer {NOTION_TOKEN}","Notion-Version":"2022-06-28","Content-Type":"application/json"}
 
-          def rt(x): return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
+          def rt(x):  return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
           def ttl(x): return {"title":[{"type":"text","text":{"content":str(x)[:200]}}]}
           def sel(x): return {"select":{"name":x}}
+          def msel(tags): return {"multi_select":[{"name":t[:100]} for t in tags if t]}
 
           posts=pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
           week=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          n=len(posts)
 
           motif_counts=posts.get("Motif_v1",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
           terr_counts =posts.get("Assigned_Territory_v4",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
-
           motif_line=" • ".join([f"{k}: {v}" for k,v in motif_counts.items()]) if motif_counts else "No motifs"
           terr_line =" • ".join([f"{k}: {v}" for k,v in terr_counts.items()])  if terr_counts  else "No territories"
+          metric_text=f"Posts: {n} | Motifs: {motif_line} | Territories: {terr_line}"
 
-          summary=f"Posts: {len(posts)} | Motifs: {motif_line} | Territories: {terr_line}"
+          avg_conf=float(posts.get("Motif_conf",pd.Series([0.5]*n)).mean()) if n else 0.5
+          conf_band="High" if avg_conf>=0.75 else ("Medium" if avg_conf>=0.5 else "Low")
 
-          bullets=[]
-          for _,r in posts.iterrows():
-            bullets.append(f"- {r.get('date_v4','?')} | {r.get('shortCode','')} | Motif: {r.get('Motif_v1','?')} | Territory: {r.get('Assigned_Territory_v4','?')} | Intent: {r.get('Caption_Intent_v1','?')} | {r.get('postUrl','')}")
+          motifs=[m for m in posts.get("Motif_v1",[]) if isinstance(m,str)]
+          intents=[i for i in posts.get("Caption_Intent_v1",[]) if isinstance(i,str)]
+          driver_tags=sorted(set(motifs+intents))
 
-          body=summary+"\n"+"\n".join(bullets)
+          def row_line(r): return f"{r.get('date_v4','?')} · {r.get('shortCode','?')} · {r.get('postUrl','')}"
+          linked_posts="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
+
+          top_motif=max(motif_counts,key=motif_counts.get) if motif_counts else None
+          top_terr =max(terr_counts, key=terr_counts.get)  if terr_counts  else None
+          if top_motif=="Crowd POV":
+            action_text="Follow crowd-led posts with a Product Macro within 24h to carry meaning."
+          elif top_motif=="Product Macro":
+            action_text="Keep macro cadence; pair with Creator POV to humanise routine."
+          elif top_motif=="Creator POV":
+            action_text="Use creator-led short cuts to bridge hype → habit."
+          else:
+            action_text="Balance reach (Crowd/Creative Momentum) with depth (Macro/Performance)."
+          if top_terr:
+            action_text+=f" Territory signal strongest in: {top_terr}."
+
+          coverage=min(1.0, n/10.0)
+          impact_score=round((coverage*avg_conf)*100)
+
+          dbg="\n".join([f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()]) if n else ""
 
           payload={
             "parent":{"database_id":DB_ID},
             "properties":{
               "Date":{"date":{"start":week}},
               "Insight Type":sel("Weekly Motifs"),
+              "Title":ttl("Weekly Motifs & Territories"),
               "Headline":rt(f"Weekly Motifs & Territories — {week}"),
-              "Status":sel("Published"),
-              "Title":ttl("Weekly Motifs & Territories")
+              "Metric":rt(metric_text),
+              "Confidence":sel(conf_band),
+              "Driver Tags":msel(driver_tags),
+              "Linked Posts":rt(linked_posts),
+              "Action":rt(action_text),
+              "Impact Score":{"number":impact_score},
+              "Debug Confidence":rt(dbg),
+              "Status":sel("Published")
             },
-            "children":[{"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":body[:1900]}}]}}]
+            "children":[
+              {"object":"block","type":"paragraph",
+               "paragraph":{"rich_text":[{"type":"text","text":{"content":metric_text}}]}}
+            ]
           }
 
           r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload))
-          print("Notion:", r.status_code, r.text[:200])
+          print("Notion:", r.status_code, r.text[:300])
           PY
 
+      # -----------------------
+      # 6) Upload artifacts
+      # -----------------------
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
