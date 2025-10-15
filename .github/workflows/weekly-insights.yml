@@ -93,6 +93,7 @@ jobs:
 
           src="pipeline/latest_posts_raw.csv"; dst="pipeline/latest_posts.csv"
           df=pd.read_csv(src,dtype=str,keep_default_na=False)
+
           lower={c.lower():c for c in df.columns}
           def col(*names):
               for n in names:
@@ -182,22 +183,8 @@ jobs:
           print("Weekly rows:", len(out))
           PY
 
-      # 3) Diagnostics: what we have / missing before downloads
-      - name: Media diagnostics (before download)
-        run: |
-          python - <<'PY'
-          import pandas as pd
-          df=pd.read_csv("pipeline/latest_posts.csv")
-          print("Weekly rows:", len(df))
-          has_vidurl = df["videoUrl"].astype(str).str.startswith("http").sum() if "videoUrl" in df else 0
-          has_disp   = df["displayUrl"].astype(str).str.startswith("http").sum() if "displayUrl" in df else 0
-          print(f"Rows with videoUrl: {has_vidurl} / {len(df)}")
-          print(f"Rows with displayUrl: {has_disp} / {len(df)}")
-          df.to_csv("pipeline/diagnostics_latest.csv", index=False)
-          PY
-
-      # 4) Download videos (with cookies) OR fallback to displayUrl thumbnail per post
-      - name: Download media (video first, else thumbnail)
+      # 3) Download videos (cookies) OR fallback displayUrl image for each post
+      - name: Download media (video first, fallback image)
         env:
           IG_SESSIONID:   ${{ secrets.IG_SESSIONID }}
           IG_DS_USER_ID:  ${{ secrets.IG_DS_USER_ID }}
@@ -214,7 +201,7 @@ jobs:
 
           df=pd.read_csv("pipeline/latest_posts.csv")
 
-          # build cookie header
+          # Build cookie header
           parts=[]
           import os as _os
           for name,envk in [("sessionid","IG_SESSIONID"),("ds_user_id","IG_DS_USER_ID"),
@@ -272,7 +259,6 @@ jobs:
               print("Fallback image failed:", sc, e)
             return False
 
-          # iterate every weekly post
           for _,r in df.iterrows():
             sc=str(r.get("shortCode") or "").strip()
             if not sc: continue
@@ -297,7 +283,7 @@ jobs:
               except: pass
           PY
 
-      # 5) Extract 10 frames from each MP4  (FIXED ffmpeg line)
+      # 4) Extract 10 frames per MP4
       - name: Extract frames (10 per video)
         run: |
           set -euo pipefail
@@ -328,7 +314,6 @@ jobs:
             stamps=[(i+1)*d/11 for i in range(10)]
             for i,t in enumerate(stamps,1):
               out=os.path.join(target, f"frame_{i:02d}.jpg")
-              # ---- fixed: removed stray quote after 'vid'
               subprocess.run(
                 ["ffmpeg","-y","-ss",f"{t:.3f}","-i",vid,"-frames:v","1","-q:v","2",out],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -336,33 +321,174 @@ jobs:
               print("Saved", out)
           PY
 
-      # 6) Diagnostics: post-download summary
-      - name: Media diagnostics (after download)
+      # 5) OpenAI: motif + caption intent + territory -> merge back
+      - name: Classify motifs + caption intent + territory (OpenAI)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          set -euo pipefail
           python - <<'PY'
-          import os, glob, pandas as pd
-          df=pd.read_csv("pipeline/latest_posts.csv")
-          ok_vids = len(glob.glob("media_video/*.mp4"))
-          ok_sets = sum(os.path.isdir(p) and len(glob.glob(p+"/*.jpg"))>=10 for p in glob.glob("frames_video/*"))
-          ok_imgs = len(glob.glob("media_fallback/*"))
-          print("SUMMARY")
-          print("  Weekly posts:", len(df))
-          print("  Videos saved:", ok_vids)
-          print("  Frame sets (>=10):", ok_sets)
-          print("  Fallback images:", ok_imgs)
+          import os, base64, glob, json, re, pandas as pd, httpx
+          from tenacity import retry, stop_after_attempt, wait_exponential
+          from openai import OpenAI
+
+          http_client=httpx.Client(trust_env=False, timeout=90)
+          client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"), http_client=http_client)
+
+          posts=pd.read_csv("pipeline/latest_posts.csv")
+
+          def enc_img(path):
+            with open(path,"rb") as f:
+              b64=base64.b64encode(f.read()).decode("utf-8")
+            return {"type":"input_image","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+
+          MOTIF_SYS=("You classify ONE visual motif for social video: "
+                     "Product Macro; Lifestyle / Environment; Crowd POV; Creator POV. "
+                     "Return ONLY JSON: {\"motif\":\"<label>\",\"confidence\":0-1}.")
+
+          TERR_SYS=("Classify ONE territory + ONE caption intent. "
+                     "Territories: Football / Messi Baseline; Future Clarity; Performance Mastery; Creative Momentum. "
+                     "Intents: Participation / Prompt; Focus / Discipline; Product / Availability; Celebration / Moment. "
+                     "Return ONLY JSON: {\"territory\":\"<one>\",\"intent\":\"<one>\"}.")
+
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
+          def classify_motif(images, caption):
+            content=[{"type":"input_text","text":MOTIF_SYS + "\nCaption context: " + (caption or "")}]
+            for p in images: content.append(enc_img(p))
+            resp=client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":content}], temperature=0)
+            return resp.choices[0].message.content.strip()
+
+          @retry(stop=stop_after_attempt(3), wait=wait_exponential(1,1,6))
+          def classify_text(caption, hint):
+            prompt=f"{TERR_SYS}\nMotif hint: {hint}\nCaption: {caption}"
+            resp=client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":prompt}], temperature=0)
+            return resp.choices[0].message.content.strip()
+
+          out=[]
+          for _, r in posts.iterrows():
+            sc=str(r.get("shortCode") or "")
+            frames=sorted(glob.glob(os.path.join("frames_video",sc,"frame_*.jpg")))
+            if not frames:
+              fb=glob.glob(os.path.join("media_fallback", f"{sc}.*"))
+              frames=[fb[0]] if fb else []
+            motif_json='{"motif":"Lifestyle / Environment","confidence":0.5}'
+            if frames:
+              picks=[frames[0], frames[len(frames)//2], frames[-1]] if len(frames)>=3 else [frames[0]]
+              try: motif_json=classify_motif(picks, r.get("caption",""))
+              except Exception as e: print("motif error", sc, e)
+            try:
+              mj=json.loads(motif_json); 
+              if isinstance(mj,str): mj=json.loads(mj)
+              motif=mj.get("motif","Lifestyle / Environment"); conf=float(mj.get("confidence",0.5))
+            except Exception:
+              m=re.search(r'"motif"\s*:\s*"([^"]+)"', motif_json); motif=m.group(1) if m else "Lifestyle / Environment"; conf=0.5
+
+            terr="Future Clarity"; intent="Celebration / Moment"
+            try:
+              tj=classify_text(r.get("caption",""), motif)
+              tj=json.loads(tj) if isinstance(tj,str) else tj
+              if isinstance(tj,str): tj=json.loads(tj)
+              terr=tj.get("territory",terr); intent=tj.get("intent",intent)
+            except Exception as e:
+              print("text classify error", sc, e)
+
+            out.append({"shortCode":sc,"Motif_v1":motif,"Motif_conf":conf,"Caption_Intent_v1":intent,"Assigned_Territory_v4":terr})
+
+          add=pd.DataFrame(out)
+          merged=posts.merge(add,on="shortCode",how="left")
+          merged.to_csv("pipeline/latest_posts.csv",index=False)
+          print("Merged into latest_posts.csv with motif/intent/territory.")
           PY
 
-      # 7) (Temporarily disabled) OpenAI + Notion steps can be re-enabled after media is stable
+      # 6) Notion: populate full weekly card (URL→Rich-text fallback for Linked Post(s))
+      - name: Publish weekly visual narrative to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_MASPLUS: ${{ secrets.NOTION_DB_MASPLUS }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, json, pandas as pd, requests
+          from datetime import datetime, timezone
 
-      # 8) Upload artifacts
+          TOK=os.environ["NOTION_TOKEN"]; DB=os.environ["NOTION_DB_MASPLUS"]
+          H={"Authorization":f"Bearer {TOK}","Notion-Version":"2022-06-28","Content-Type":"application/json"}
+
+          def rt(x):  return {"rich_text":[{"type":"text","text":{"content":str(x)[:1900]}}]}
+          def ttl(x): return {"title":[{"type":"text","text":{"content":str(x)[:200]}}]}
+          def sel(x): return {"select":{"name":x}}
+          def msel(tags): return {"multi_select":[{"name":t[:100]} for t in tags if t]}
+
+          posts=pd.read_csv("pipeline/latest_posts.csv") if os.path.exists("pipeline/latest_posts.csv") else pd.DataFrame()
+          week=datetime.now(timezone.utc).strftime("%Y-%m-%d"); n=len(posts)
+
+          motif_counts=posts.get("Motif_v1",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+          terr_counts =posts.get("Assigned_Territory_v4",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+          motif_line=" • ".join([f"{k}: {v}" for k,v in motif_counts.items()]) if motif_counts else "No motifs"
+          terr_line =" • ".join([f"{k}: {v}" for k,v in terr_counts.items()])  if terr_counts  else "No territories"
+          metric=f"Posts: {n} | Motifs: {motif_line} | Territories: {terr_line}"
+
+          avg_conf=float(posts.get("Motif_conf",pd.Series([0.5]*n)).mean()) if n else 0.5
+          conf="High" if avg_conf>=0.75 else ("Medium" if avg_conf>=0.5 else "Low")
+
+          motifs=[m for m in posts.get("Motif_v1",[]) if isinstance(m,str)]
+          intents=[i for i in posts.get("Caption_Intent_v1",[]) if isinstance(i,str)]
+          drivers=sorted(set(motifs+intents))
+
+          def row_line(r): return f"{r.get('date_v4','?')} · {r.get('shortCode','?')} · {r.get('postUrl','')}"
+          linked_list="\n".join([row_line(r) for _,r in posts.iterrows()]) if n else ""
+
+          first_url=""
+          if n:
+            for _,r in posts.iterrows():
+              u=str(r.get("postUrl","") or "")
+              if u.startswith("http"): first_url=u; break
+
+          # Recommendation (stronger)
+          top_motif=max(motif_counts,key=motif_counts.get) if motif_counts else None
+          top_terr=max(terr_counts,key=terr_counts.get) if terr_counts else None
+          rec="Anchor performance-led posts with consistent Product Macro follow-ups."
+          if top_motif=="Crowd POV": rec="Follow crowd peaks with Macro/Creator POV within 24h to convert reach to depth."
+          elif top_motif=="Product Macro": rec="Sustain Macro cadence; interleave Creator POV to humanise routine."
+          elif top_motif=="Creator POV": rec="Scale creator-led short edits; bookend with Product Macro for recall."
+          if top_terr: rec+=f" Territory strongest: {top_terr}."
+
+          coverage=min(1.0,n/10.0); impact=round(coverage*avg_conf*100)
+          dbg="\n".join([f"{r.get('shortCode','?')}: {r.get('Motif_conf',0)}" for _,r in posts.iterrows()]) if n else ""
+
+          payload_url={"parent":{"database_id":DB},"properties":{
+            "Date":{"date":{"start":week}},
+            "Insight Type":sel("Weekly Motifs"),
+            "Title":ttl("Weekly Motifs & Territories"),
+            "Headline":rt(f"Weekly Motifs & Territories — {week}"),
+            "Metric":rt(metric),
+            "Confidence":sel(conf),
+            "Driver Tags":msel(drivers),
+            "Linked Post(s)":{"url": first_url},
+            "Action":rt(rec),
+            "Impact Score":{"number":impact},
+            "Debug Confidence":rt(dbg),
+            "Status":sel("Published")
+          }}
+
+          r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_url))
+          if r.status_code==400 and "expected to be url" in r.text.lower():
+            props=payload_url["properties"].copy()
+            props["Linked Post(s)"]=rt(linked_list)
+            payload_rt={"parent":{"database_id":DB},"properties":props}
+            r=requests.post("https://api.notion.com/v1/pages", headers=H, data=json.dumps(payload_rt))
+
+          print("Notion:", r.status_code, r.text[:300])
+          PY
+
+      # 7) Upload artifacts
       - name: Upload weekly artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: weekly_media_diagnostics
+          name: weekly_full_bundle
           path: |
             pipeline/latest_posts_raw.csv
             pipeline/latest_posts.csv
-            pipeline/diagnostics_latest.csv
             media_video
             frames_video
             media_fallback
